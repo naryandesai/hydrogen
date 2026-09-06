@@ -34,7 +34,7 @@ from pipeline.common.utils import (
     BASE_DIR, SCREENING_DIR, setup_logger, print_banner,
     k_B_eV, bep_activation_energy, arrhenius_rate,
     abundance_cost_penalty, save_screening_db,
-    check_element_safety, is_valid_for_application,
+    check_element_safety,
     CRUSTAL_ABUNDANCE_PPM, MELTING_POINT_K,
 )
 
@@ -730,12 +730,18 @@ def evaluate_candidate(genome: tuple, calc, refs: dict) -> dict:
         E_act = bep_activation_energy(dE_split, material_class=mat_class)
         result['E_act'] = E_act
 
-        # 7. Coking resistance index
+        # 7. Coking resistance index (slab descriptor — out of scope for melts)
+        from pipeline.common.application_scope import slab_coking_index_scope
+        coking_scope = slab_coking_index_scope(genome)
+        result['coking_index_scope'] = coking_scope['status']
+        result['coking_index_scope_reason'] = coking_scope.get('reason')
+
         coking_index = dE_C - 2.0 * dE_H  # positive = resistant
-        
-        # Apply liquid-metal coking resistance bonus for NTEC mode
+
+        # Apply liquid-metal coking resistance bonus for NTEC mode (diagnostic only
+        # when slab coking is in scope; MoltenMetal ranking must not use this).
         py_mode = os.environ.get('PYROLYSIS_MODE', 'ntec')
-        if py_mode == 'ntec':
+        if py_mode == 'ntec' and coking_scope['status'] == 'candidate':
             from pipeline.screening.genetic_optimizer import _extract_elements_from_genome
             from pipeline.process.ntec_model import conditions_from_environment, ntec_assistance
             assistance = ntec_assistance(conditions_from_environment())
@@ -744,8 +750,12 @@ def evaluate_candidate(genome: tuple, calc, refs: dict) -> dict:
                 coking_index += assistance['coking_bonus']
                 result['ntec_evidence_status'] = assistance['status']
                 result['ntec_assistance'] = assistance
-            
-        result['coking_index'] = coking_index
+
+        if coking_scope['status'] == 'out_of_scope':
+            result['coking_index'] = float('nan')
+            result['coking_index_raw_slab'] = coking_index
+        else:
+            result['coking_index'] = coking_index
 
         # 8. Stability metric
         if mat_class in ('SolidCatalyst', 'MoltenMetal'):
@@ -775,8 +785,10 @@ def evaluate_candidate(genome: tuple, calc, refs: dict) -> dict:
             result['error'] = safety_reason
             return result
 
-        # 10c. Application feasibility flag
-        result['pyrolysis_viable'] = is_valid_for_application(mat_class, 'pyrolysis')
+        # 10c. Encoded-phase admissibility (ADR 0001). Coverage lists stay 14-class.
+        from pipeline.common.application_scope import phase_stable_at_application_T
+        result['pyrolysis_viable'] = (
+            phase_stable_at_application_T(genome)['status'] == 'candidate')
 
         # 11. Physical sanity filters
         # Meta model can produce unphysical energies on exotic structures.
@@ -794,7 +806,18 @@ def evaluate_candidate(genome: tuple, calc, refs: dict) -> dict:
         result['E_act_censored'] = result['E_act'] in (0.01, 5.0)
         if result['E_act_censored']:
             result['needs_dft_validation'] = True
-        result['coking_index'] = max(-20.0, min(result.get('coking_index', 0), 20.0))
+        # coking_index is required. Two different "empty" states:
+        #   * missing key  → evaluation did not finish the descriptor; fail closed
+        #     (never invent 0; that would look like moderate coking resistance)
+        #   * explicit NaN → slab descriptor out of scope (MoltenMetal). That is a
+        #     set value. Python min/max keep NaN; do not clamp or replace it.
+        if 'coking_index' not in result:
+            result['valid'] = False
+            result['error'] = 'coking_index was never set'
+            return result
+        coking_val = result['coking_index']
+        if coking_val == coking_val:  # finite; NaN != NaN
+            result['coking_index'] = max(-20.0, min(float(coking_val), 20.0))
 
         # 12. OOD confidence — how much we trust this prediction
         from pipeline.common.ood_detector import compute_model_confidence

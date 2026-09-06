@@ -72,11 +72,18 @@ def main():
         parser.error('scanner and QE resource dimensions must be positive')
     if args.calibration_probes < 20:
         parser.error('--calibration-probes must be at least 20 for the tree ranker')
-    required_validation = 14 * args.min_validation_per_class
+    from pipeline.common.application_scope import (
+        APPLICATION_PYROLYSIS, validation_quota_class_count)
+    from pipeline.common.catalyst_spaces import ALL_MATERIAL_CLASSES
+    n_quota_classes = validation_quota_class_count(
+        ALL_MATERIAL_CLASSES, APPLICATION_PYROLYSIS)
+    required_validation = n_quota_classes * args.min_validation_per_class
     if args.validation_batch < required_validation:
         parser.error(
             f'--validation-batch must be at least {required_validation} to reserve '
-            f'{args.min_validation_per_class} candidate(s) across all 14 classes')
+            f'{args.min_validation_per_class} candidate(s) across {n_quota_classes} '
+            f'quota-eligible pyrolysis classes (phase-unstable classes exempt; '
+            f'coverage still 14)')
     requested_qe_cpus = (args.qe_mpi_ranks * args.qe_omp_threads *
                          args.qe_max_concurrent)
     available_cpus = os.cpu_count() or 1
@@ -225,16 +232,15 @@ def main():
 
     pareto_genomes, screening_db = run_branch_discovery(branch_config)
 
+    from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
+
     valid_db = screening_db[screening_db['valid'] == True].copy()
     ranking_db = valid_db
     if 'E_act_censored' in ranking_db.columns:
         uncensored = ranking_db[ranking_db['E_act_censored'] != True]
         if len(uncensored):
             ranking_db = uncensored
-    if 'E_act' in valid_db.columns:
-        top_catalysts = ranking_db.nsmallest(args.top_k, 'E_act')
-    else:
-        top_catalysts = valid_db.head(args.top_k)
+    top_catalysts = select_turquoise_pyrolysis_candidates(ranking_db, args.top_k)
 
     pipeline_state['phase1'] = {
         'pareto_size': len(pareto_genomes),
@@ -256,8 +262,18 @@ def main():
         try:
             from pipeline.process.reactor_mechanisms import write_full_mechanism
             from pipeline.process.reactor_models import run_reactor_sweep
+            from pipeline.process.equilibrium_check import run_equilibrium_sweep
 
             reactor_temps = [773.15, 900.0, 1100.0, 1300.0]
+            eq_result = run_equilibrium_sweep()
+            print(f"  Equilibrium check within_tol={eq_result.get('within_tolerance')} "
+                  f"worst_err={eq_result.get('worst_abs_error')}")
+            reactor_kwargs = {
+                'co2_permitted': False,
+                'fluidized_mode': 'circulating',
+                'max_regen_cycles': 3,
+                'regen_mechanism': 'mechanical',
+            }
 
             reactor_results = []
             n_reactor = min(20, len(top_catalysts))
@@ -270,7 +286,8 @@ def main():
                     mech_file = write_full_mechanism(cat_name, e_act)
                     sweep = run_reactor_sweep(cat_name, str(mech_file),
                                               temperatures=reactor_temps,
-                                              catalyst_E_act_eV=e_act)
+                                              catalyst_E_act_eV=e_act,
+                                              reactor_config_kwargs=reactor_kwargs)
                     if any(result.get('mock') for result in sweep):
                         raise RuntimeError('mock reactor output is forbidden in production')
                     best_condition = max(sweep, key=lambda r: r.get('CH4_conversion', 0)) if sweep else {}

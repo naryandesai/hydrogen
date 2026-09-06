@@ -91,6 +91,8 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         config.fc_top_k_pemfc = 5
 
     pipeline_state = load_json("pipeline_state.json") or {}
+    top_catalysts = None
+    screening_valid_db = None
 
     # ═════════════════════════════════════════════════════════════════════════
     # PHASE 1: DETERMINISTIC BRANCH-AND-BOUND
@@ -117,12 +119,12 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         )
         pareto_genomes, screening_db = run_branch_discovery(branch_config)
 
-        # Select top-K from Pareto front
+        # Select pyrolysis-admissible top-K (MetalHydride never proceeds).
+        from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
         valid_db = screening_db[screening_db['valid'] == True].copy()
-        if 'E_act' in valid_db.columns:
-            top_catalysts = valid_db.nsmallest(config.top_k_reactor, 'E_act')
-        else:
-            top_catalysts = valid_db.head(config.top_k_reactor)
+        screening_valid_db = valid_db
+        top_catalysts = select_turquoise_pyrolysis_candidates(
+            valid_db, config.top_k_reactor)
 
         pipeline_state['phase1'] = {
             'pareto_size': len(pareto_genomes),
@@ -147,36 +149,63 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
 
         from pipeline.process.reactor_mechanisms import write_full_mechanism, write_gri30_subset
         from pipeline.process.reactor_models import run_reactor_sweep
+        from pipeline.process.equilibrium_check import run_equilibrium_sweep
+        from pipeline.process.phase2_scorecard import (
+            build_solids_scorecard, log_solids_scorecard,
+        )
 
-        # Write gas-phase mechanism
+        # Write gas + condensed graphite mechanism; equilibrium gate first.
         write_gri30_subset()
+        eq_result = run_equilibrium_sweep()
+        if not eq_result.get('within_tolerance', False):
+            logger.warning(
+                'Equilibrium check outside tolerance '
+                f"(worst_abs_error={eq_result.get('worst_abs_error')})")
 
-        # For each top catalyst, generate mechanism and run reactor sweep
-        if 'top_catalysts' not in dir():
-            # Load from previous phase
+        # Reactor list always comes from the full valid pool + hydride filter.
+        # Phase 1+2: use in-memory screening_valid_db. Phase-2-only: load CSV.
+        from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
+        if screening_valid_db is None:
             import pandas as pd
             db_path = SCREENING_DIR / "ga_full_database.csv"
             if db_path.exists():
-                valid_db = pd.read_csv(db_path)
-                valid_db = valid_db[valid_db['valid'] == True]
-                top_catalysts = valid_db.nsmallest(config.top_k_reactor, 'E_act')
+                screening_valid_db = pd.read_csv(db_path)
+                screening_valid_db = screening_valid_db[
+                    screening_valid_db['valid'] == True]
+            elif not config.allow_mock_inputs:
+                raise RuntimeError(
+                    'screening database is required; mock catalyst fallback is disabled')
             else:
-                if not config.allow_mock_inputs:
-                    raise RuntimeError(
-                        'screening database is required; mock catalyst fallback is disabled')
                 logger.warning("No screening database found. Using mock catalysts.")
-                top_catalysts = None
 
+        if screening_valid_db is not None:
+            before = len(screening_valid_db)
+            top_catalysts = select_turquoise_pyrolysis_candidates(
+                screening_valid_db, config.top_k_reactor)
+            logger.info(
+                f"Turquoise pyrolysis scope: {len(top_catalysts)} reactor "
+                f"candidates from {before} valid rows "
+                f"(phase_stable_at_application_T; coverage denominator unchanged)")
+        else:
+            top_catalysts = None
+
+        reactor_kwargs = {
+            'co2_permitted': False,
+            'fluidized_mode': 'circulating',
+            'max_regen_cycles': 3,
+            'regen_mechanism': 'mechanical',
+        }
         reactor_results = []
         if top_catalysts is not None:
             for idx, row in top_catalysts.iterrows():
                 cat_name = f"cat_{idx}"
                 E_act = row.get('E_act', 0.8)
+                dE_H = row.get('dE_H', -0.5)
 
                 # Generate Cantera mechanism
                 mech_path = write_full_mechanism(
                     cat_name, E_act_CH4=E_act,
-                    E_act_H_desorb=max(0.3, abs(row.get('dE_H', -0.5))),
+                    E_act_H_desorb=max(0.3, abs(dE_H if dE_H is not None else -0.5)),
                 )
 
                 # Run reactor sweep
@@ -184,6 +213,9 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
                     cat_name, str(mech_path),
                     temperatures=list(config.reactor_temperatures),
                     reactor_types=list(config.reactor_types),
+                    catalyst_E_act_eV=float(E_act) if E_act is not None else 0.8,
+                    catalyst_dE_H_eV=float(dE_H) if dE_H is not None else 0.0,
+                    reactor_config_kwargs=reactor_kwargs,
                 )
                 reactor_results.extend(results)
         else:
@@ -194,16 +226,26 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
                     name, str(mech_path),
                     temperatures=list(config.reactor_temperatures),
                     reactor_types=list(config.reactor_types),
+                    catalyst_E_act_eV=e_act,
+                    reactor_config_kwargs=reactor_kwargs,
                 )
                 reactor_results.extend(results)
 
+        scorecard = build_solids_scorecard(reactor_results)
+        save_json(scorecard, 'phase2_solids_scorecard.json', subdir='reactor')
+        log_solids_scorecard(scorecard, logger)
         pipeline_state['phase2'] = {
             'n_simulations': len(reactor_results),
             'elapsed_s': time.time() - t2,
+            'equilibrium_check': {
+                'within_tolerance': eq_result.get('within_tolerance'),
+                'worst_abs_error': eq_result.get('worst_abs_error'),
+            },
+            'solids_scorecard': scorecard,
+            'best_conversion': scorecard.get('headline_solids_conversion'),
+            'best_conversion_scope': 'solids_single_pass_judge_cat_9',
+            'mmbcr_max_conversion': scorecard.get('mmbcr_max_conversion'),
         }
-        if reactor_results:
-            best_conv = max(r.get('CH4_conversion', 0) for r in reactor_results)
-            pipeline_state['phase2']['best_conversion'] = best_conv
 
         save_json(pipeline_state, "pipeline_state.json")
         logger.info(f"Phase 2 complete: {len(reactor_results)} simulations, {time.time()-t2:.0f}s")
@@ -218,7 +260,7 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         from pipeline.validation.dft_validator import validate_catalyst
 
         dft_results = []
-        if 'top_catalysts' in dir() and top_catalysts is not None:
+        if top_catalysts is not None:
             top_dft = top_catalysts.head(config.top_k_dft)
             for idx, row in top_dft.iterrows():
                 try:

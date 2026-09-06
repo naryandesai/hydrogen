@@ -281,6 +281,22 @@ def test_adaptive_validation_policy():
                                              min_per_class=1,
                                              uncertainties=[0, 0, 0, 1, 0])
         assert {candidates[i][0] for i in selected} == {'SAC', 'MoltenMetal', 'MXene'}
+        # MetalHydride is enumerated but does not consume reserved validation slots.
+        hydride_cands = candidates + [('MetalHydride', 'La', 'H2', 'None', 'None', 400)]
+        hydride_obj = np.vstack([objectives, [[0.01, 1]]])
+        selected_h = allocate_validation_batch(
+            hydride_cands, hydride_obj, 3, db, 'test', min_per_class=1)
+        assert 'MetalHydride' not in {hydride_cands[i][0] for i in selected_h}
+        # Pyrolysis reserved slots skip every phase-unstable class (ADR 0001).
+        pyro_cands = [
+            ('SAC', 'Fe', 'N4', 'N-graphene', 'OH'),
+            ('MOF', 'W', 'Triazolate', 'N2P2', 16.0),
+            ('MoltenMetal', 'Bi', 'Ni', 10, 1000),
+        ]
+        pyro_obj = np.array([[0.9, 1], [0.01, 1], [0.8, 1]])
+        selected_p = allocate_validation_batch(
+            pyro_cands, pyro_obj, 2, db, 'turquoise_pyrolysis', min_per_class=1)
+        assert {pyro_cands[i][0] for i in selected_p} == {'SAC', 'MoltenMetal'}
         try:
             allocate_validation_batch(candidates, objectives, 2, db, 'test', min_per_class=1)
         except ValueError as exc:
@@ -1171,20 +1187,297 @@ def test_retired_ga_entry_points_are_blocked():
 
 
 def test_industrial_viability_gates_fail_closed():
-    from pipeline.validation.viability import evaluate_turquoise, evaluate_fuel_cell
+    from pipeline.validation.viability import (
+        evaluate_turquoise, evaluate_fuel_cell, TurquoiseHydrogenBounds)
     assert evaluate_turquoise({})['status'] == 'unknown'
     good_h2 = evaluate_turquoise({
         'temperature_K': 1000, 'H2_selectivity': 0.98, 'CH4_conversion': 0.8,
         'deactivation_fraction_per_h': 0.005, 'coke_fraction': 0.02,
         'net_energy_kWh_kg_h2': 12.0, 'measured_reactor': 1})
     assert good_h2['status'] == 'pass'
-    assert evaluate_turquoise({'H2_selectivity': 0.8})['status'] == 'fail'
+    # H2 selectivity gate is off by default (lumped metric is not true selectivity).
+    assert evaluate_turquoise({'H2_selectivity': 0.8, 'CH4_conversion': 0.8,
+                               'temperature_K': 1000,
+                               'deactivation_fraction_per_h': 0.005,
+                               'coke_fraction': 0.02,
+                               'net_energy_kWh_kg_h2': 12.0,
+                               'measured_reactor': 1})['status'] == 'pass'
+    gated = evaluate_turquoise(
+        {'H2_selectivity': 0.8, 'CH4_conversion': 0.8, 'temperature_K': 1000,
+         'deactivation_fraction_per_h': 0.005, 'coke_fraction': 0.02,
+         'net_energy_kWh_kg_h2': 12.0, 'measured_reactor': 1},
+        TurquoiseHydrogenBounds(enforce_h2_selectivity_gate=True))
+    assert gated['status'] == 'fail'
+    assert evaluate_turquoise({
+        'temperature_K': 1000, 'CH4_conversion': 0.8,
+        'deactivation_fraction_per_h': 0.005, 'coke_fraction': 0.02,
+        'net_energy_kWh_kg_h2': 12.0, 'measured_reactor': 1,
+        'co2_permitted': True})['status'] == 'fail'
     good_fc = evaluate_fuel_cell({
         'orr_overpotential_V': 0.3, 'peak_power_W_cm2': 1.2,
         'system_efficiency': 0.5, 'voltage_degradation_uV_h': 5,
         'measured_hours': 500, 'measured_mea': 1})
     assert good_fc['status'] == 'pass'
     assert evaluate_fuel_cell({'orr_overpotential_V': 0.6})['status'] == 'fail'
+
+
+def test_coking_loss_masks_nan_targets():
+    """NaN coking targets must not train the coking head or poison other heads."""
+    import torch
+    import torch.nn as nn
+    from pipeline.common.catalyst_spaces import FEATURE_DIM
+    from pipeline.screening.surrogate_model import _masked_mse, train_surrogate
+
+    mse = nn.MSELoss()
+    pred = torch.tensor([[1.0], [2.0], [3.0]])
+    target = torch.tensor([[1.0], [float('nan')], [3.0]])
+    valid = torch.tensor([True, True, True])
+    loss = _masked_mse(pred, target, valid, mse)
+    assert torch.isfinite(loss)
+    assert torch.isclose(loss, torch.tensor(0.0))
+
+    rng = np.random.default_rng(0)
+    n = 16
+    X = rng.standard_normal((n, FEATURE_DIM)).astype(np.float32)
+    y_valid = np.ones(n, dtype=np.float32)
+    y_de = rng.standard_normal(n).astype(np.float32)
+    y_coking = rng.standard_normal(n).astype(np.float32)
+    y_coking[:6] = np.nan
+    y_seg = rng.standard_normal(n).astype(np.float32)
+    y_e = np.abs(rng.standard_normal(n)).astype(np.float32) + 0.2
+    model = train_surrogate(
+        X, y_valid, y_de, y_coking, y_seg, y_e,
+        epochs=2, batch_size=8, device='cpu')
+    for p in model.parameters():
+        assert torch.isfinite(p).all()
+
+
+def test_slab_coking_scope_excludes_molten_metal():
+    from pipeline.common.application_scope import slab_coking_index_scope
+    assert slab_coking_index_scope(('MoltenMetal', 'Bi', 'Ni', 10.0, 1000))['status'] == 'out_of_scope'
+    assert slab_coking_index_scope(('SolidCatalyst', 'Ni', 'Al2O3', 'fcc111', 0.0, ('Fe',), 1, 0))['status'] == 'candidate'
+
+
+def test_phase_stable_at_application_t_per_class():
+    from pipeline.common.application_scope import (
+        phase_stable_at_application_T, is_turquoise_pyrolysis_candidate,
+        VALIDATION_QUOTA_EXEMPT_CLASSES, validation_quota_class_count)
+    from pipeline.common.catalyst_spaces import ALL_MATERIAL_CLASSES
+    assert phase_stable_at_application_T(('MetalHydride', 'La'))['status'] == 'out_of_scope'
+    assert phase_stable_at_application_T(('MOF', 'W', 'Triazolate', 'N2P2', 16.0))['status'] == 'out_of_scope'
+    assert phase_stable_at_application_T(('COF', 'W', 'Imide', 'P4', 40.0))['status'] == 'out_of_scope'
+    assert phase_stable_at_application_T(('MXene', 'Ti', 'C', 2, 'O', 'Fe'))['status'] == 'out_of_scope'
+    assert phase_stable_at_application_T(('Perovskite', 'La', 'Fe', 'None'))['status'] == 'out_of_scope'
+    assert phase_stable_at_application_T(('MoltenMetal', 'Bi', 'Ni', 10.0, 1000))['status'] == 'candidate'
+    assert is_turquoise_pyrolysis_candidate("('MOF', 'W', 'Triazolate', 'N2P2', 16.0)") is False
+    assert VALIDATION_QUOTA_EXEMPT_CLASSES == frozenset({'MetalHydride'})
+    assert validation_quota_class_count(ALL_MATERIAL_CLASSES) == len(ALL_MATERIAL_CLASSES) - 1
+    assert validation_quota_class_count(
+        ALL_MATERIAL_CLASSES, 'turquoise_pyrolysis') == len(ALL_MATERIAL_CLASSES) - 5
+
+
+def test_turquoise_pyrolysis_select_excludes_metal_hydride():
+    import pandas as pd
+    from pipeline.common.application_scope import (
+        is_turquoise_pyrolysis_candidate, select_turquoise_pyrolysis_candidates)
+    hydride = "('MetalHydride', 'La', 'H2', 'None', 'None', 400)"
+    melt = "('MoltenMetal', 'Bi', 'Ni', 10.0, 1000)"
+    solid = "('SolidCatalyst', 'Ni', 'Al2O3', 'fcc111', 0.0, ('Fe',), 1, 0)"
+    mof = "('MOF', 'W', 'Triazolate', 'N2P2', 16.0)"
+    assert is_turquoise_pyrolysis_candidate(hydride) is False
+    assert is_turquoise_pyrolysis_candidate(melt) is True
+    df = pd.DataFrame([
+        {'genome': hydride, 'E_act': 0.05, 'valid': True},
+        {'genome': mof, 'E_act': 0.02, 'valid': True},
+        {'genome': melt, 'E_act': 0.80, 'valid': True},
+        {'genome': solid, 'E_act': 0.90, 'valid': True},
+        {'genome': 'not-a-genome', 'E_act': 0.01, 'valid': True},
+    ])
+    selected = select_turquoise_pyrolysis_candidates(df, top_k=2)
+    genomes = set(selected['genome'])
+    assert hydride not in genomes
+    assert mof not in genomes
+    assert 'not-a-genome' not in genomes
+    assert list(selected['E_act']) == [0.80, 0.90]
+
+
+def test_mechanism_has_condensed_graphite_not_gas_carbon():
+    from pipeline.process.reactor_mechanisms import write_full_mechanism, write_gas_only_mechanism
+    gas_path = write_gas_only_mechanism()
+    full_path = write_full_mechanism('test_cat_scope', E_act_CH4=0.9)
+    gas_txt = gas_path.read_text(encoding='utf-8')
+    full_txt = full_path.read_text(encoding='utf-8')
+    assert 'C_graphite' not in gas_txt and 'C_graphite' not in full_txt
+    assert 'thermo: fixed-stoichiometry' in gas_txt
+    assert 'C(gr)' in gas_txt and 'C(gr)' in full_txt
+    assert 'C_s => C_graphite' not in full_txt
+    assert 'name: C_s' in full_txt
+
+
+def test_staged_sweep_preserves_coarse_and_proposes_roi():
+    import tempfile
+    from pathlib import Path
+    from pipeline.process import staged_sweep
+    old = staged_sweep.SWEEPS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        staged_sweep.SWEEPS_DIR = Path(tmp)
+        try:
+            spec = staged_sweep.SweepSpec(
+                name='demo',
+                levers={'x': [1.0, 2.0, 4.0], 'y': [0.2, 1.0]},
+                score_key='score',
+                constraint_key='ok',
+                keep_fraction_of_max=0.5,
+                n_targeted_per_lever=4,
+                hard_bounds={'x': (0.5, 8.0), 'y': (0.0, 1.0)},
+            )
+            records = [
+                {'x': 1.0, 'y': 1.0, 'score': 0.1, 'ok': True},
+                {'x': 2.0, 'y': 1.0, 'score': 0.4, 'ok': True},
+                {'x': 4.0, 'y': 1.0, 'score': 1.0, 'ok': True},
+                {'x': 4.0, 'y': 0.2, 'score': 0.2, 'ok': True},
+                {'x': 8.0, 'y': 1.0, 'score': 2.0, 'ok': False},
+            ]
+            coarse = {'records': records, 'levels': spec.levers, 'n_grid_cells': 6}
+            staged_sweep.write_stage('demo', 'coarse', coarse)
+            try:
+                staged_sweep.write_stage('demo', 'coarse', coarse)
+            except FileExistsError:
+                pass
+            else:
+                raise AssertionError('coarse sweep must be write-once')
+            roi = staged_sweep.propose_roi(coarse, spec)
+            assert roi['bounds']['x'][0] < 4.0
+            assert roi['bounds']['x'][1] >= 4.0
+            staged_sweep.write_stage('demo', 'targeted', {
+                'records': [{'score': 1.1}], 'roi': roi, 'n_grid_cells': roi['n_grid_cells']})
+            bundle = staged_sweep.load_sweep('demo')
+            assert bundle['coarse'] is not None
+            assert bundle['targeted'] is not None
+            assert bundle['coarse']['n_grid_cells'] == 6
+            assert bundle['manifest']['coarse_preserved'] is True
+        finally:
+            staged_sweep.SWEEPS_DIR = old
+
+
+def test_inventory_levers_preserve_baseline_area():
+    from pipeline.process.reactor_models import (
+        ReactorConfig, _validate_carbon_policy, active_sv, ergun_delta_p_pa,
+        geometric_sv_pfr, inventory_grid_cells)
+    from pipeline.process.reactor_models import (
+        DEFAULT_METAL_DISPERSION, DEFAULT_METAL_LOADING,
+        DEFAULT_SOLIDS_PARTICLE_MM)
+    assert abs(DEFAULT_SOLIDS_PARTICLE_MM - 0.13) < 1e-15
+    assert abs(DEFAULT_METAL_LOADING - 0.5) < 1e-15
+    assert abs(DEFAULT_METAL_DISPERSION - 0.3) < 1e-15
+    cfg = ReactorConfig(
+        catalyst_particle_mm=2.0, metal_loading=1.0, metal_dispersion=1.0)
+    _validate_carbon_policy(cfg)
+    assert abs(geometric_sv_pfr(cfg) - 1800.0) < 1e-9
+    assert abs(active_sv(geometric_sv_pfr(cfg), cfg) - 1800.0) < 1e-9
+    small = ReactorConfig(
+        catalyst_particle_mm=0.2, metal_loading=1.0, metal_dispersion=1.0)
+    prod = ReactorConfig()
+    assert abs(prod.catalyst_particle_mm - 0.13) < 1e-15
+    assert abs(prod.metal_loading - 0.5) < 1e-15
+    assert abs(prod.metal_dispersion - 0.3) < 1e-15
+    assert geometric_sv_pfr(prod) > geometric_sv_pfr(cfg)
+    assert abs(active_sv(geometric_sv_pfr(prod), prod)
+               / geometric_sv_pfr(prod) - 0.15) < 1e-9
+    assert abs(geometric_sv_pfr(small) / geometric_sv_pfr(cfg) - 10.0) < 1e-9
+    half = ReactorConfig(
+        catalyst_particle_mm=2.0, metal_loading=0.5, metal_dispersion=1.0)
+    assert abs(active_sv(geometric_sv_pfr(half), half) - 900.0) < 1e-9
+    assert ergun_delta_p_pa(small) > ergun_delta_p_pa(cfg)
+    cells = inventory_grid_cells()
+    assert len(cells) == 36
+    assert cells[0] == {
+        'catalyst_particle_mm': 2.0, 'metal_loading': 1.0, 'metal_dispersion': 1.0}
+    from pipeline.process.reactor_models import inventory_roi_grid_cells
+    roi = inventory_roi_grid_cells()
+    assert len(roi) == 54
+    assert roi[0]['catalyst_particle_mm'] == 0.25
+    assert max(c['catalyst_particle_mm'] for c in roi) <= 0.25
+    assert min(c['catalyst_particle_mm'] for c in roi) >= 0.08
+    try:
+        _validate_carbon_policy(ReactorConfig(metal_loading=1.5))
+    except ValueError as exc:
+        assert 'invent area' in str(exc)
+    else:
+        raise AssertionError('loading > 1 must fail closed')
+
+
+def test_solids_scorecard_judges_cat_9_not_h_parked():
+    from pipeline.process.phase2_scorecard import build_solids_scorecard, is_h_parked
+    h_parked = {
+        'reactor_type': 'PFR', 'catalyst_name': 'cat_40', 'T_K': 1300.0,
+        'CH4_conversion': 0.003, 'single_pass_CH4_conversion': 0.003,
+        'catalyst_E_act_eV': 0.01, 'catalyst_dE_H_eV': -2.5,
+        'active_sv_1_m': 4153.8, 'WHSV_h-1': 900.0,
+        'ergun_delta_p_bar': 0.40, 'ergun_ok': True,
+    }
+    judge = {
+        'reactor_type': 'PFR', 'catalyst_name': 'cat_9', 'T_K': 1300.0,
+        'CH4_conversion': 0.0102, 'single_pass_CH4_conversion': 0.0102,
+        'catalyst_E_act_eV': 0.43, 'catalyst_dE_H_eV': -0.90,
+        'active_sv_1_m': 4153.8, 'WHSV_h-1': 900.0,
+        'ergun_delta_p_bar': 0.40, 'ergun_ok': True,
+    }
+    fluid = dict(judge)
+    fluid.update({
+        'reactor_type': 'Fluidized',
+        'single_pass_CH4_conversion': 0.0122,
+        'CH4_conversion': 0.0122,
+        'WHSV_h-1': 180.0,
+    })
+    melt = {
+        'reactor_type': 'MMBCR', 'catalyst_name': 'cat_9', 'T_K': 1300.0,
+        'CH4_conversion': 0.985, 'catalyst_E_act_eV': 0.43, 'catalyst_dE_H_eV': -0.90,
+    }
+    assert is_h_parked(h_parked)
+    assert not is_h_parked(judge)
+    card = build_solids_scorecard([h_parked, judge, fluid, melt])
+    assert card['judge_catalyst'] == 'cat_9'
+    assert abs(card['headline_solids_conversion'] - 0.0102) < 1e-9
+    assert card['headline']['PFR']['WHSV_h-1'] == 900.0
+    assert card['headline']['Fluidized']['single_pass_CH4_conversion'] == 0.0122
+    assert abs(card['mmbcr_max_conversion'] - 0.985) < 1e-9
+    assert card['solids_max_excluding_h_parked']['catalyst_name'] == 'cat_9'
+
+
+def test_site_density_locked_to_monolayer():
+    from pipeline.process.reactor_mechanisms import (
+        MONOLAYER_SITE_DENSITY_MOL_CM2, write_full_mechanism)
+    from pipeline.process.reactor_models import ReactorConfig, _validate_carbon_policy
+    assert abs(MONOLAYER_SITE_DENSITY_MOL_CM2 - 2.5e-9) < 1e-15
+    path = write_full_mechanism('test_gamma_lock', E_act_CH4=0.9)
+    assert 'site-density: 2.500e-09 mol/cm^2' in path.read_text(encoding='utf-8')
+    try:
+        write_full_mechanism('test_gamma_lock', E_act_CH4=0.9, site_density=1e-6)
+    except ValueError as exc:
+        assert 'B1 locks' in str(exc)
+    else:
+        raise AssertionError('raised site_density must fail closed')
+    try:
+        _validate_carbon_policy(ReactorConfig(site_density_mol_cm2=1e-6))
+    except ValueError as exc:
+        assert 'B1 locks' in str(exc)
+    else:
+        raise AssertionError('ReactorConfig site_density override must fail closed')
+
+
+def test_oxidative_regen_requires_co2_permitted():
+    from pipeline.process.reactor_models import ReactorConfig, simulate_pfr
+    cfg = ReactorConfig(
+        reactor_type='PFR', catalyst_name='x', mechanism_file='',
+        max_regen_cycles=1, regen_mechanism='oxidative', co2_permitted=False)
+    try:
+        simulate_pfr(cfg)
+    except RuntimeError as exc:
+        assert 'co2_permitted' in str(exc)
+    else:
+        raise AssertionError('oxidative regen should be blocked')
+
 
 
 def test_prior_art_registry_tracks_exact_and_region_novelty():
@@ -1395,6 +1688,14 @@ if __name__ == '__main__':
     test("README matches branch-only contract", test_readme_matches_branch_only_contract)
     test("Retired GA entry points are blocked", test_retired_ga_entry_points_are_blocked)
     test("Industrial viability gates fail closed", test_industrial_viability_gates_fail_closed)
+    test("Phase stability per class", test_phase_stable_at_application_t_per_class)
+    test("Pyrolysis select excludes unstable phases", test_turquoise_pyrolysis_select_excludes_metal_hydride)
+    test("Slab coking excludes melts", test_slab_coking_scope_excludes_molten_metal)
+    test("Mechanism uses condensed graphite", test_mechanism_has_condensed_graphite_not_gas_carbon)
+    test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
+    test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
+    test("Staged sweep keeps coarse and proposes ROI", test_staged_sweep_preserves_coarse_and_proposes_roi)
+    test("Oxidative regen requires co2_permitted", test_oxidative_regen_requires_co2_permitted)
     test("Prior-art novelty states", test_prior_art_registry_tracks_exact_and_region_novelty)
     test("Multi-objective archive keeps conflicting winners", test_multiobjective_archive_preserves_conflicting_winners)
     test("Final campaign readiness fails closed", test_final_campaign_readiness_fails_closed)

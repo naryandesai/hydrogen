@@ -131,7 +131,20 @@ def generate_full_report(pipeline_state: Dict = None) -> Path:
     r(f"| Best activation barrier | {p1.get('best_E_act', 'N/A')} eV |")
     r(f"| Best coking resistance | {p1.get('best_coking', 'N/A')} |")
     r(f"| Reactor simulations | {p2.get('catalysts_simulated', 'N/A')} |")
-    r(f"| Best CH₄ conversion | {p2.get('best_conversion', 'N/A'):.1%} |" if isinstance(p2.get('best_conversion'), (int, float)) else f"| Best CH₄ conversion | N/A |")
+    solids_x = p2.get('best_conversion')
+    if not isinstance(solids_x, (int, float)) and isinstance(p2.get('solids_scorecard'), dict):
+        solids_x = p2['solids_scorecard'].get('headline_solids_conversion')
+    if isinstance(solids_x, (int, float)):
+        r(f"| Solids judge CH₄ conversion (cat_9 PFR) | {solids_x:.2%} |")
+    else:
+        r("| Solids judge CH₄ conversion (cat_9 PFR) | N/A |")
+    mmbcr_x = p2.get('mmbcr_max_conversion')
+    if not isinstance(mmbcr_x, (int, float)) and isinstance(p2.get('solids_scorecard'), dict):
+        mmbcr_x = p2['solids_scorecard'].get('mmbcr_max_conversion')
+    if isinstance(mmbcr_x, (int, float)):
+        r(f"| MMBCR max CH₄ conversion | {mmbcr_x:.1%} (not a solids rank) |")
+    else:
+        r("| MMBCR max CH₄ conversion | N/A |")
     r(f"| FC catalysts evaluated | {p5.get('total_evaluated', p5.get('n_cathodes_screened', 'N/A')):,} |" if isinstance(p5.get('total_evaluated', p5.get('n_cathodes_screened')), (int, float)) else f"| FC catalysts evaluated | N/A |")
     r(f"| Best PEMFC power density | {p5.get('best_power_W_cm2', 'N/A')} W/cm² |" if isinstance(p5.get('best_power_W_cm2'), (int, float)) else f"| Best PEMFC power density | N/A |")
     r(f"| Best PEMFC efficiency | {p5.get('best_efficiency', 'N/A'):.1%} |" if isinstance(p5.get('best_efficiency'), (int, float)) else f"| Best PEMFC efficiency | N/A |")
@@ -177,17 +190,54 @@ def generate_full_report(pipeline_state: Dict = None) -> Path:
     # ─── Phase 2: Reactor Simulation ────────────────────────────────────────
     r("## Phase 2: Reactor-Scale Simulation\n")
 
-    real_reactor = [x for x in data['reactor'] if not x.get('mock', False)]
-    if real_reactor:
-        r("| Catalyst | Reactor | T (K) | CH₄ Conv. | H₂ Select. | τ (s) |")
-        r("|----------|---------|-------|-----------|------------|-------|")
-        for res in sorted(real_reactor, key=lambda x: x.get('CH4_conversion', 0), reverse=True)[:20]:
+    from pipeline.process.phase2_scorecard import (
+        is_production_reactor_record, is_solids_run, single_pass_x,
+    )
+    scorecard = p2.get('solids_scorecard') or load_json(
+        'phase2_solids_scorecard.json', subdir='reactor') or {}
+    if scorecard.get('headline'):
+        r("Solids judged on **cat_9** (single-pass X, `a`, WHSV, ΔP). "
+          "MMBCR X_eq and 0.01 eV H-parked cats are not ranks.\n")
+        r("| Reactor | Catalyst | T (K) | Single-pass X | a (m⁻¹) | WHSV (h⁻¹) | ΔP (bar) |")
+        r("|---------|----------|-------|---------------|---------|------------|----------|")
+        for rt, row in scorecard['headline'].items():
+            a = row.get('active_sv_1_m')
+            whsv = row.get('WHSV_h-1')
+            dp = row.get('ergun_delta_p_bar')
+            a_s = f"{a:.0f}" if isinstance(a, (int, float)) else "—"
+            w_s = f"{whsv:.0f}" if isinstance(whsv, (int, float)) else "—"
+            d_s = f"{dp:.2f}" if isinstance(dp, (int, float)) else "—"
+            r(f"| {rt} | {row.get('catalyst_name', '?')} | {row.get('T_K', '?')} | "
+              f"{row.get('single_pass_CH4_conversion', 0):.2%} | "
+              f"{a_s} | {w_s} | {d_s} |")
+        r("")
+        if scorecard.get('mmbcr_max_conversion') is not None:
+            r(f"MMBCR max X = {scorecard['mmbcr_max_conversion']:.1%} "
+              f"({scorecard.get('mmbcr_note', 'not a solids rank')})\n")
+
+    real_reactor = [
+        x for x in data['reactor']
+        if is_production_reactor_record(x) and not x.get('mock', False)
+    ]
+    solids = [x for x in real_reactor if is_solids_run(x)]
+    if solids:
+        r("### Solids runs (single-pass)\n")
+        r("| Catalyst | Reactor | T (K) | Single-pass X | a (m⁻¹) | WHSV (h⁻¹) | ΔP (bar) |")
+        r("|----------|---------|-------|---------------|---------|------------|----------|")
+        for res in sorted(solids, key=single_pass_x, reverse=True)[:20]:
+            a = res.get('active_sv_1_m')
+            whsv = res.get('WHSV_h-1')
+            dp = res.get('ergun_delta_p_bar')
+            a_s = f"{a:.0f}" if isinstance(a, (int, float)) else "—"
+            w_s = f"{whsv:.0f}" if isinstance(whsv, (int, float)) else "—"
+            d_s = f"{dp:.2f}" if isinstance(dp, (int, float)) else "—"
             r(f"| {res.get('catalyst_name', '?')} | {res.get('reactor_type', '?')} | "
-              f"{res.get('T_K', '?')} | {res.get('CH4_conversion', 0):.1%} | "
-              f"{res.get('H2_selectivity', 'N/A')} | {res.get('residence_time_s', '?'):.1f} |")
+              f"{res.get('T_K', '?')} | {single_pass_x(res):.2%} | "
+              f"{a_s} | {w_s} | {d_s} |")
         r("")
     if len(real_reactor) != len(data['reactor']):
-        r(f"Excluded {len(data['reactor']) - len(real_reactor)} mock reactor records from performance claims.\n")
+        r(f"Excluded {len(data['reactor']) - len(real_reactor)} non-run reactor files "
+          f"(sweeps, mocks) from performance claims.\n")
 
     # ─── Phase 3: DFT Validation ───────────────────────────────────────────
     r("## Phase 3: DFT Validation (Quantum ESPRESSO)\n")

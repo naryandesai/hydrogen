@@ -1,0 +1,154 @@
+"""B1-5 Phase 2 solids scorecard.
+
+Reports single-pass X, active a, WHSV, and Ergun ΔP. Solids are judged on
+cat_9 (modest |dE_H|). 0.01 eV H-parked cats and MMBCR X_eq are not ranks.
+"""
+
+from __future__ import annotations
+
+JUDGE_CATALYST = 'cat_9'
+SOLIDS_TYPES = frozenset({'PFR', 'Fluidized'})
+H_PARKED_E_ACT_MAX = 0.05
+H_PARKED_ABS_DEH_MIN = 2.0
+HEADLINE_T_MIN = 1200.0
+
+
+def is_h_parked(record: dict) -> bool:
+    e_act = record.get('catalyst_E_act_eV')
+    dE_H = record.get('catalyst_dE_H_eV')
+    if e_act is None or dE_H is None:
+        return False
+    return float(e_act) <= H_PARKED_E_ACT_MAX and abs(float(dE_H)) >= H_PARKED_ABS_DEH_MIN
+
+
+def is_production_reactor_record(record: dict) -> bool:
+    return (
+        isinstance(record, dict)
+        and record.get('reactor_type') in {'PFR', 'Fluidized', 'MMBCR'}
+        and record.get('catalyst_name')
+        and 'CH4_conversion' in record
+        and 'records' not in record
+    )
+
+
+def is_solids_run(record: dict) -> bool:
+    return (
+        is_production_reactor_record(record)
+        and record.get('reactor_type') in SOLIDS_TYPES
+        and not record.get('mock', False)
+    )
+
+
+def single_pass_x(record: dict) -> float:
+    value = record.get('single_pass_CH4_conversion', record.get('CH4_conversion'))
+    return float(value or 0.0)
+
+
+def _t_k(record: dict) -> float:
+    try:
+        return float(record.get('T_K') or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def metric_row(record: dict) -> dict:
+    return {
+        'catalyst_name': record.get('catalyst_name'),
+        'reactor_type': record.get('reactor_type'),
+        'T_K': record.get('T_K'),
+        'single_pass_CH4_conversion': single_pass_x(record),
+        'active_sv_1_m': record.get('active_sv_1_m'),
+        'WHSV_h-1': record.get('WHSV_h-1'),
+        'ergun_delta_p_Pa': record.get('ergun_delta_p_Pa'),
+        'ergun_delta_p_bar': record.get('ergun_delta_p_bar'),
+        'ergun_ok': record.get('ergun_ok'),
+        'catalyst_E_act_eV': record.get('catalyst_E_act_eV'),
+        'catalyst_dE_H_eV': record.get('catalyst_dE_H_eV'),
+        'h_parked': is_h_parked(record),
+        'catalyst_particle_mm': record.get('catalyst_particle_mm'),
+        'metal_loading': record.get('metal_loading'),
+        'metal_dispersion': record.get('metal_dispersion'),
+    }
+
+
+def build_solids_scorecard(results) -> dict:
+    solids = [metric_row(r) for r in results if is_solids_run(r)]
+    mmbcr = [
+        r for r in results
+        if is_production_reactor_record(r)
+        and r.get('reactor_type') == 'MMBCR'
+        and not r.get('mock', False)
+    ]
+    judge_rows = [r for r in solids if r['catalyst_name'] == JUDGE_CATALYST]
+    judge_reason = (
+        'modest |dE_H| probe; not 0.01 eV H-parked; '
+        'MMBCR X_eq is not a solids rank'
+    )
+    headline = {}
+    for reactor_type in ('PFR', 'Fluidized'):
+        candidates = [
+            r for r in judge_rows
+            if r['reactor_type'] == reactor_type and _t_k(r) >= HEADLINE_T_MIN
+        ]
+        if candidates:
+            headline[reactor_type] = max(candidates, key=_t_k)
+
+    eligible = [r for r in solids if not r['h_parked']]
+    if not headline:
+        judge_reason += '; cat_9 missing, used best non-H-parked solids'
+        for reactor_type in ('PFR', 'Fluidized'):
+            candidates = [
+                r for r in eligible
+                if r['reactor_type'] == reactor_type and _t_k(r) >= HEADLINE_T_MIN
+            ]
+            if candidates:
+                headline[reactor_type] = max(
+                    candidates, key=lambda r: r['single_pass_CH4_conversion'])
+
+    solids_max = (
+        max(eligible, key=lambda r: r['single_pass_CH4_conversion'])
+        if eligible else None
+    )
+    h_parked = [r for r in solids if r['h_parked'] and _t_k(r) >= HEADLINE_T_MIN]
+    mmbcr_max = max(
+        (float(r.get('CH4_conversion') or 0.0) for r in mmbcr),
+        default=None,
+    )
+    judge_x = None
+    if headline.get('PFR'):
+        judge_x = headline['PFR']['single_pass_CH4_conversion']
+    elif headline.get('Fluidized'):
+        judge_x = headline['Fluidized']['single_pass_CH4_conversion']
+
+    return {
+        'judge_catalyst': JUDGE_CATALYST if judge_rows else None,
+        'judge_reason': judge_reason,
+        'headline': headline,
+        'headline_solids_conversion': judge_x,
+        'solids_max_excluding_h_parked': solids_max,
+        'h_parked_excluded': h_parked,
+        'mmbcr_max_conversion': mmbcr_max,
+        'mmbcr_note': 'X_eq by construction for large Da; not a catalyst rank (B5)',
+        'n_solids_records': len(solids),
+        'n_mmbcr_records': len(mmbcr),
+    }
+
+
+def log_solids_scorecard(scorecard: dict, logger) -> None:
+    logger.info(
+        f"B1-5 solids scorecard: judge={scorecard.get('judge_catalyst')} "
+        f"({scorecard.get('judge_reason')})"
+    )
+    for reactor_type, row in (scorecard.get('headline') or {}).items():
+        x = row.get('single_pass_CH4_conversion') or 0.0
+        a = row.get('active_sv_1_m')
+        whsv = row.get('WHSV_h-1')
+        dp = row.get('ergun_delta_p_bar')
+        logger.info(
+            f"  {reactor_type} {row.get('catalyst_name')} "
+            f"T={row.get('T_K')}  X={x:.2%}  a={a}  "
+            f"WHSV={whsv} h-1  dP={dp} bar"
+        )
+    mmbcr = scorecard.get('mmbcr_max_conversion')
+    if mmbcr is not None:
+        logger.info(f"  MMBCR max X={mmbcr:.2%} ({scorecard.get('mmbcr_note')})")
