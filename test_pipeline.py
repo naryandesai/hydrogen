@@ -1429,6 +1429,7 @@ def test_solids_scorecard_judges_cat_9_not_h_parked():
         'catalyst_E_act_eV': 0.01, 'catalyst_dE_H_eV': -2.5,
         'active_sv_1_m': 4153.8, 'WHSV_h-1': 900.0,
         'ergun_delta_p_bar': 0.40, 'ergun_ok': True,
+        'surface_loaded': True,
     }
     judge = {
         'reactor_type': 'PFR', 'catalyst_name': 'cat_9', 'T_K': 1300.0,
@@ -1436,6 +1437,7 @@ def test_solids_scorecard_judges_cat_9_not_h_parked():
         'catalyst_E_act_eV': 0.43, 'catalyst_dE_H_eV': -0.90,
         'active_sv_1_m': 4153.8, 'WHSV_h-1': 900.0,
         'ergun_delta_p_bar': 0.40, 'ergun_ok': True,
+        'surface_loaded': True,
     }
     fluid = dict(judge)
     fluid.update({
@@ -1463,6 +1465,43 @@ def test_solids_scorecard_judges_cat_9_not_h_parked():
     assert unnamed['judge_catalyst_requested'] is None
     assert unnamed['judge_catalyst'] is None
     assert unnamed['headline_catalyst'] == 'cat_9'
+
+
+def test_solids_run_requires_loaded_surface():
+    from pipeline.process.phase2_scorecard import is_solids_run, build_solids_scorecard
+    base = {
+        'reactor_type': 'PFR', 'catalyst_name': 't', 'T_K': 1300.0,
+        'CH4_conversion': 1e-5, 'single_pass_CH4_conversion': 1e-5,
+    }
+    assert not is_solids_run(base)
+    assert not is_solids_run({**base, 'surface_loaded': False})
+    assert not is_solids_run({**base, 'surface_loaded': True, 'mock': True})
+    assert not is_solids_run({**base, 'surface_loaded': True, 'gas_only': True})
+    assert is_solids_run({**base, 'surface_loaded': True})
+    blank = {**base, 'surface_loaded': False, 'gas_only': False}
+    card = build_solids_scorecard([blank])
+    assert card['n_solids_records'] == 0
+    assert card['headline_solids_conversion'] is None
+
+
+def test_mismatched_catalyst_name_fails_closed():
+    try:
+        import cantera  # noqa: F401
+    except ImportError:
+        return
+    from pipeline.process.reactor_mechanisms import write_full_mechanism
+    from pipeline.process.reactor_models import ReactorConfig, simulate_pfr
+    path = write_full_mechanism('t_0_05', E_act_CH4=0.9)
+    cfg = ReactorConfig(
+        mechanism_file=str(path), catalyst_name='t',
+        reactor_type='PFR', T_inlet_K=1000.0)
+    try:
+        simulate_pfr(cfg)
+    except RuntimeError as exc:
+        assert 't_surface' in str(exc)
+        assert 'gas_only' in str(exc)
+    else:
+        raise AssertionError('name mismatch must not return a blank X')
 
 
 def test_ch4_conversion_uses_argon_tracer_when_c2_present():
@@ -1766,6 +1805,8 @@ if __name__ == '__main__':
     test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
     test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
     test("Solids scorecard takes named judge as argument", test_solids_scorecard_judges_cat_9_not_h_parked)
+    test("Solids run requires loaded surface", test_solids_run_requires_loaded_surface)
+    test("Mismatched catalyst name fails closed", test_mismatched_catalyst_name_fails_closed)
     test("CH4 conversion uses Ar tracer", test_ch4_conversion_uses_argon_tracer_when_c2_present)
     test("MMBCR k0 and flotation fail closed", test_mmbcr_k0_and_flotation_fail_closed)
     test("Staged sweep keeps coarse and proposes ROI", test_staged_sweep_preserves_coarse_and_proposes_roi)

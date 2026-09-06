@@ -20,6 +20,8 @@
 
 A metal monolayer is already ~10¹⁹ atoms/m². Extra “sites” in the CMD literature come from dispersion and high Ni loading, then die to encapsulating carbon and plugging [1,2,3].
 
+B1’s X ∝ a (corr ≈ 1) is the monolayer identity on a path that ends at `C_s`, not kinetic closure. Intra-pass site return is [B6](B6-off-site-carbon-nucleation.md). Do not raise Γ.
+
 **Refs (same numbering as ADR 0001)**
 
 1. Alves et al., *Renew. Sustain. Energy Rev.* **2021**, *137*, 110465.

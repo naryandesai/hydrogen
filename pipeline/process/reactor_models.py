@@ -142,6 +142,9 @@ class ReactorConfig:
     circulating_carbon_removal_rate_1_s: float = 0.5
     # Oxidative regen locked unless explicitly enabled for testing.
     co2_permitted: bool = False
+    # Fail-closed: surface and graphite must load unless the caller asked
+    # for a gas-only run. A name mismatch must not become X ≈ 0.
+    gas_only: bool = False
 
 
 def _validate_carbon_policy(config: ReactorConfig) -> None:
@@ -364,15 +367,34 @@ def _load_gas_and_surface(config: ReactorConfig):
     graphite = None
     try:
         graphite = ct.Solution(config.mechanism_file, 'graphite')
-    except Exception:
-        graphite = None
+    except Exception as exc:
+        if not config.gas_only:
+            raise RuntimeError(
+                f'graphite phase missing from {config.mechanism_file}; '
+                'set gas_only=True only for an explicit gas-only run'
+            ) from exc
     surf = None
     surf_name = f'{config.catalyst_name}_surface'
     try:
         surf = ct.Interface(config.mechanism_file, surf_name, [gas])
-    except Exception:
-        surf = None
+    except Exception as exc:
+        if not config.gas_only:
+            raise RuntimeError(
+                f'surface {surf_name!r} missing from {config.mechanism_file} '
+                f'(catalyst_name={config.catalyst_name!r} must match the '
+                'YAML written by write_full_mechanism); set gas_only=True '
+                'only for an explicit gas-only run'
+            ) from exc
     return gas, graphite, surf
+
+
+def _load_status_fields(config: ReactorConfig, graphite, surf) -> dict:
+    return {
+        'gas_only': bool(config.gas_only),
+        'surface_loaded': surf is not None,
+        'graphite_loaded': graphite is not None,
+        'surface_name': f'{config.catalyst_name}_surface',
+    }
 
 
 def _species_x(gas, name: str) -> float:
@@ -528,7 +550,7 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
         return _mock_reactor_result(config, 'MMBCR')
 
     logger.info(f"Simulating MMBCR: {config.catalyst_name} at {config.T_inlet_K} K")
-    gas, _graphite, _surf = _load_gas_and_surface(config)
+    gas, graphite, surf = _load_gas_and_surface(config)
     gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
     x_ch4_feed = _species_x(gas, 'CH4') or 0.95
     x_ar_feed = _species_x(gas, 'Ar')
@@ -607,6 +629,7 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
         'theta_C_profile': [0.0] * len(conversion_profile),
         **_kinetics_evidence(config),
         **_policy_metadata(config),
+        **_load_status_fields(config, graphite, surf),
     }
     logger.info(
         f"  MMBCR result: conversion={final_conv:.2%}, "
@@ -625,7 +648,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         return _mock_reactor_result(config, 'PFR')
 
     logger.info(f"Simulating PFR: {config.catalyst_name} at {config.T_inlet_K} K")
-    gas, _graphite, surf = _load_gas_and_surface(config)
+    gas, graphite, surf = _load_gas_and_surface(config)
     gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
 
     eps = config.bed_porosity
@@ -729,6 +752,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         **solids_inventory_fields(config, geometric_sv_pfr(config)),
         **_kinetics_evidence(config),
         **_policy_metadata(config),
+        **_load_status_fields(config, graphite, surf),
     }
     logger.info(f"  PFR result: conversion={final_conv:.2%}, τ={tau_total:.1f}s, "
                 f"regen_cycles={cycles_completed}")
@@ -771,7 +795,7 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
         f"Simulating Fluidized ({config.fluidized_mode}): "
         f"{config.catalyst_name} at {config.T_inlet_K} K"
     )
-    gas, _graphite, surf = _load_gas_and_surface(config)
+    gas, graphite, surf = _load_gas_and_surface(config)
     gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
     ch4_initial = _species_x(gas, 'CH4') or 1.0
     ar_initial = _species_x(gas, 'Ar')
@@ -836,6 +860,7 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
         **solids_inventory_fields(config, geometric_sv_fluidized(config)),
         **_kinetics_evidence(config),
         **_policy_metadata(config),
+        **_load_status_fields(config, graphite, surf),
     }
     logger.info(f"  Fluidized result: conversion={final_conv:.2%} mode={config.fluidized_mode}")
     return result
@@ -877,6 +902,7 @@ def _mock_reactor_result(config: ReactorConfig, reactor_type: str) -> Dict:
         'mock': True,
         **_kinetics_evidence(config),
         **_policy_metadata(config),
+        **_load_status_fields(config, None, None),
     }
 
 

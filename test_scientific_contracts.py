@@ -134,6 +134,25 @@ def test_candidate_cantera_mechanism_records_kinetics_provenance():
     assert 'C_s' in surface.species_names
 
 
+def test_reactor_surface_load_fails_closed_on_name_mismatch():
+    try:
+        import cantera  # noqa: F401
+    except ImportError:
+        return
+    from pipeline.process.reactor_mechanisms import write_full_mechanism
+    from pipeline.process.reactor_models import ReactorConfig, simulate_pfr
+    path = write_full_mechanism('t_0_05', E_act_CH4=0.9)
+    cfg = ReactorConfig(
+        mechanism_file=str(path), catalyst_name='t',
+        reactor_type='PFR', T_inlet_K=1000.0)
+    try:
+        simulate_pfr(cfg)
+    except RuntimeError as exc:
+        assert 't_surface' in str(exc)
+    else:
+        raise AssertionError('name mismatch must not return a blank X')
+
+
 def test_stage_selection_rescues_incomplete_evidence_without_feeding_reactor():
     import pandas as pd
     from pipeline.screening.stage_selection import (

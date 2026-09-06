@@ -5,7 +5,7 @@
 - Any increase in PFR τ (`L`, `ε`, `u`, `d_p`) is bounded by Ergun ΔP, stoichiometric coking/plugging, and heat duty — not by “make it an MMBCR.”
 - Do not claim a long overloaded bed is a good catalyst: high inventory + low WHSV sits on X_eq or mass transfer [3].
 - Pilot TCD residence times of 2–12 s [11] are the comparison band (we are at 4 s).
-- Continuous operation still requires B2 outfeed.
+- Continuous operation still requires B2 outfeed. Lengthening τ without B6 still saturates at the monolayer identity `X ≈ n_sites / n_CH4`.
 
 **Why**
 

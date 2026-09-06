@@ -33,9 +33,13 @@ def is_production_reactor_record(record: dict) -> bool:
 
 
 def is_solids_run(record: dict) -> bool:
+    """PFR/fluidized with a loaded Langmuir surface. Missing surface_loaded
+    (legacy JSON) or gas_only/mock is not a solids result."""
     return (
         is_production_reactor_record(record)
         and record.get('reactor_type') in SOLIDS_TYPES
+        and record.get('surface_loaded') is True
+        and not record.get('gas_only', False)
         and not record.get('mock', False)
     )
 

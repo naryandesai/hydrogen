@@ -63,8 +63,9 @@ MOF, COF, MXene, and Perovskite still earn PEMFC reserved slots (they are in-sco
 
 ### What this is not
 
-- Not a slab-coking rule. `coking_index = ΔE_C − 2ΔE_H` stays defined for any class with a slab, including MetalHydride.
+- Not a slab-coking rule. `coking_index = ΔE_C − 2ΔE_H` stays defined for any class with a slab, including MetalHydride. That index is not the filament vs encapsulating branch (B6).
 - Not a claim that residual metal, MOF-derived carbon, TiC, or exsolved Ni is inactive. Those need their own genomes.
+- Not a grant of the Baker/Helveg filament path. SAC remaining a pyrolysis **candidate** means the encoded single-atom phase can exist at application T. It does not mean Cα can dissolve, diffuse, and nucleate graphite at a separate face [24–26, 33]. That physics is B6 and is nanoparticle-only.
 
 ## References
 
@@ -91,3 +92,14 @@ MOF, COF, MXene, and Perovskite still earn PEMFC reserved slots (they are in-sco
 21. Seredych, M.; et al. High-Temperature Behavior and Surface Chemistry of Ti₃C₂Tₓ MXenes. *Chem. Mater.* (thermal loss of Tₓ; conversion toward TiC).
 22. Neagu, D.; Tsekouras, G.; Miller, D. N.; Ménard, H.; Irvine, J. T. S. In situ growth of nanoparticles through control of non-stoichiometry. *Nat. Chem.* **2013**, *5*, 916–923.
 23. Kousi, K.; Neagu, D.; Bekris, L.; Papaioannou, E. I.; Metcalfe, I. S. Endogenous nanoparticles strain perovskite host lattice providing oxygen capacity and driving oxygen exchange and CH₄ conversion. *Angew. Chem. Int. Ed.* **2020**, *59*, 2510–2519.
+24. Baker, R. T. K.; Barber, M. A.; Harris, P. S.; Feates, F. S.; Waite, R. J. Nucleation and growth of carbon deposits from the nickel catalyzed decomposition of acetylene. *J. Catal.* **1972**, *26*, 51–62. DOI: [10.1016/0021-9517(72)90032-2](https://doi.org/10.1016/0021-9517(72)90032-2).
+25. Helveg, S.; López-Cartes, C.; Sehested, J.; Hansen, P. L.; Clausen, B. S.; Rostrup-Nielsen, J. R.; Abild-Pedersen, F.; Nørskov, J. K. Atomic-scale imaging of carbon nanofibre growth. *Nature* **2004**, *427*, 426–429. DOI: [10.1038/nature02278](https://doi.org/10.1038/nature02278).
+26. Abild-Pedersen, F.; Nørskov, J. K.; Rostrup-Nielsen, J. R.; Sehested, J.; Helveg, S. Mechanisms for catalytic carbon nanofiber growth studied by *ab initio* density functional theory calculations. *Phys. Rev. B* **2006**, *73*, 115419. DOI: [10.1103/PhysRevB.73.115419](https://doi.org/10.1103/PhysRevB.73.115419).
+27. Snoeck, J.-W.; Froment, G. F.; Fowles, M. Filamentous carbon formation and gasification: thermodynamics, driving force, nucleation, and steady-state growth. *J. Catal.* **1997**, *169*, 240–249. DOI: [10.1006/jcat.1997.1634](https://doi.org/10.1006/jcat.1997.1634).
+28. Snoeck, J.-W.; Froment, G. F.; Fowles, M. Kinetic study of the carbon filament formation by methane cracking on a nickel catalyst. *J. Catal.* **1997**, *169*, 250–262. DOI: [10.1006/jcat.1997.1635](https://doi.org/10.1006/jcat.1997.1635).
+29. Xu, M.; Lopez-Ruiz, J. A.; Kovarik, L.; et al. Structure sensitivity and its effect on methane turnover and carbon co-product selectivity in thermocatalytic decomposition of methane over supported Ni catalysts. *Appl. Catal. A* **2021**, *611*, 117967. DOI: [10.1016/j.apcata.2020.117967](https://doi.org/10.1016/j.apcata.2020.117967).
+30. Gili, A.; Schlicker, L.; Bekheet, M. F.; Görke, O.; Kober, D.; Simon, U.; Littlewood, P.; Schomäcker, R.; Doran, A.; Gaissmaier, D.; Jacob, T.; Selve, S.; Gurlo, A. Revealing the mechanism of multiwalled carbon nanotube growth on supported nickel nanoparticles by in situ synchrotron X-ray diffraction, density functional theory, and molecular dynamics simulations. *ACS Catal.* **2019**, *9*, 6999–7011. DOI: [10.1021/acscatal.9b00733](https://doi.org/10.1021/acscatal.9b00733).
+31. Ermakova, M. A.; Ermakov, D. Yu. Ni/SiO₂ and Fe/SiO₂ catalysts for production of hydrogen and filamentous carbon via methane decomposition. *Catal. Today* **2002**, *77*, 225–235. DOI: [10.1016/S0920-5861(02)00248-1](https://doi.org/10.1016/S0920-5861(02)00248-1).
+32. Amin, A.; Epling, W. S.; Croiset, E. Reaction and deactivation rates of methane catalytic cracking over nickel. *Ind. Eng. Chem. Res.* **2011**, *50*, 12460–12470. DOI: [10.1021/ie201194z](https://doi.org/10.1021/ie201194z).
+33. Akri, M.; et al. Atomically dispersed nickel as coke-resistant active sites for methane dry reforming. *Nat. Commun.* **2019**, *10*, 5181. DOI: [10.1038/s41467-019-12843-w](https://doi.org/10.1038/s41467-019-12843-w).
+34. Takenaka, S.; Ogihara, H.; Yamanaka, I.; Otsuka, K. Decomposition of methane over supported-Ni catalysts: effects of the supports on the catalytic lifetime. *Appl. Catal. A* **2001**, *217*, 137–146. DOI: [10.1016/S0926-860X(01)00593-2](https://doi.org/10.1016/S0926-860X(01)00593-2).

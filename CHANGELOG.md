@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### 2026-09-06 — Surface/graphite load fail-closed
+
+`_load_gas_and_surface` no longer swallows a missing Langmuir surface or graphite phase. A `catalyst_name` that does not match the YAML (or a stale mechanism) raises unless `ReactorConfig.gas_only=True`. Results record `surface_loaded` / `graphite_loaded`; `is_solids_run` requires `surface_loaded is True`, so a blank X cannot enter the scorecard. Remaining Phase 2 cleanups (PFR nonlocal closure, unused imports, hand-rolled test harness, `_ch4_extent` import cycle) are listed in the README, not done.
+
+### 2026-09-06 — B6 documented: no intra-pass turnovers on solids
+
+Surface YAML still ends at `C_s`. Not implemented. README, ADR 0001 refs [24]–[34], and [`docs/backlog/B6-off-site-carbon-nucleation.md`](docs/backlog/B6-off-site-carbon-nucleation.md) now state the three identities (E_act sweep is structurally flat; X ∝ a; melt vs bed is turnovers vs no turnovers) and the literature plan: Cα → Cγ lump plus a Cδ competitor, nanoparticle metals only, B5 judge off `cat_9` at 1300 K. B2 will not close B5. `carbon_transfer_eV = 1.5` remains unused (Baker / Abild-Pedersen Ni transport).
+
 ### 2026-09-06 — Solids X mole balance, wired melt flotation
 
 PFR/fluidized `CH4_conversion` is the Ar-tracer ratio `1 - (x_CH4/x_Ar)/(x_CH4,0/x_Ar,0)`. The H2 mole-balance is exact only for CH4/H2/inert (equilibrium check). The solids YAML has an active C2 chain, so that denominator deflates bed X in the low-Da regime. `1 - x_CH4/x_CH4,0` remains `CH4_mole_fraction_drop` only.
