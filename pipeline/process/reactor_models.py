@@ -49,9 +49,11 @@ ERGUN_DP_LIMIT_PA = 101325.0
 
 # Melt-side interfacial prefactor (B3). Order-of-magnitude bubble-interface
 # velocity, not a DFT barrier and not a Upham-fitted mass-transfer k.
-# Upham 2017; Chen 2023; Abdollahi 2024. Cap prevents inventing Da.
+# Upham 2017; Chen 2023; Abdollahi 2024. The 1 m/s cap is a guardrail
+# against inventing Da, not a physical bound like loading ≤ 1.
 MMBCR_INTERFACIAL_K0_DEFAULT = 0.01
 MMBCR_INTERFACIAL_K0_MAX = 1.0
+MMBCR_INTERFACIAL_K0_MAX_KIND = 'guardrail_not_physical_bound'
 # None = unconstrained flotation (carbon leaves as produced). 0 = fouled
 # interface. Finite = k_float / (k_float + k_if * a) on the ODE.
 MMBCR_FLOTATION_UNCONSTRAINED = None
@@ -167,7 +169,8 @@ def _validate_carbon_policy(config: ReactorConfig) -> None:
         raise ValueError(
             f'mmbcr_interfacial_k0_m_s={config.mmbcr_interfacial_k0_m_s} '
             f'must be in (0, {MMBCR_INTERFACIAL_K0_MAX}]; '
-            'k0 is a calibrated melt-side prefactor, not a DFT / Da knob (B3)')
+            f'{MMBCR_INTERFACIAL_K0_MAX} m/s is a guardrail against inventing '
+            'Da, not a physical bound like loading <= 1 (B3)')
     if (config.mmbcr_carbon_removal_rate_1_s is not None
             and config.mmbcr_carbon_removal_rate_1_s < 0.0):
         raise ValueError(
@@ -233,6 +236,11 @@ def _policy_metadata(config: ReactorConfig) -> Dict:
         'mmbcr_interfacial_k0_basis': (
             'calibrated melt-side prefactor; not DFT or Upham-fitted k; '
             'B3; Upham 2017; Chen 2023; Abdollahi 2024'),
+        'mmbcr_interfacial_k0_max_m_s': MMBCR_INTERFACIAL_K0_MAX,
+        'mmbcr_interfacial_k0_max_kind': MMBCR_INTERFACIAL_K0_MAX_KIND,
+        'mmbcr_flotation_default': 'unconstrained (eta=1); knob wired but off',
+        'solids_thermal_mode': 'isothermal_energy_disabled',
+        'solids_conversion_basis': 'argon_tracer',
         'h2_metric_note': (
             'H2_atom_balance is not branching selectivity; lumped mechanism '
             'has no C2 competition branch for true H2 selectivity'),
@@ -469,10 +477,26 @@ def _mmbcr_flotation_eta(k_if_m_s: float, sv_ratio_1_m: float,
     return float(k_float_1_s / denom)
 
 
-def _ch4_extent(gas) -> float:
-    from pipeline.process.equilibrium_check import ch4_conversion_from_mole_fractions
-    return ch4_conversion_from_mole_fractions(
-        _species_x(gas, 'CH4'), _species_x(gas, 'H2'))
+def _ch4_extent(gas, x_ch4_feed: float, x_ar_feed: float) -> float:
+    from pipeline.process.equilibrium_check import ch4_conversion_from_argon_tracer
+    return ch4_conversion_from_argon_tracer(
+        _species_x(gas, 'CH4'), _species_x(gas, 'Ar'), x_ch4_feed, x_ar_feed)
+
+
+def _require_ar_tracer(x_ch4_feed: float, x_ar_feed: float) -> None:
+    if x_ar_feed <= 0 or x_ch4_feed <= 0:
+        raise ValueError(
+            'solids CH4 conversion uses an Ar mole-fraction tracer; '
+            'inlet_composition must include Ar (default CH4:0.95, Ar:0.05)')
+
+
+def _disable_reactor_energy(reactor) -> str:
+    """Hold solids stages at inlet T so they match isothermal MMBCR."""
+    if hasattr(reactor, 'energy_enabled'):
+        reactor.energy_enabled = False
+        return 'isothermal_energy_disabled'
+    raise RuntimeError(
+        'Cantera reactor has no energy_enabled; cannot force isothermal solids')
 
 
 def _mole_fraction_drop(gas, x_ch4_feed: float) -> float:
@@ -575,6 +599,7 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
         'mmbcr_flotation_eta': float(eta_float),
         'mmbcr_Da': float(k_if * sv_ratio * tau_total * eta_float),
         'conversion_basis': 'melt_ode_to_Xeq',
+        'thermal_mode': 'isothermal_by_construction',
         **kinetics_fields(config),
         'z_positions': z_positions.tolist(),
         'conversion_profile': conversion_profile,
@@ -606,6 +631,8 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
     eps = config.bed_porosity
     sv_ratio = active_sv(geometric_sv_pfr(config), config)
     ch4_initial = _species_x(gas, 'CH4') or 1.0
+    ar_initial = _species_x(gas, 'Ar')
+    _require_ar_tracer(ch4_initial, ar_initial)
 
     n_stages = 50
     bed_cross_area = np.pi * (config.bed_diameter_m / 2) ** 2
@@ -617,6 +644,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
 
     z_positions = np.linspace(0, config.bed_length_m, n_stages + 1)
     conversion_profile = [0.0]
+    temperature_profile = [config.T_inlet_K]
     theta_C_tos = [_coverage(surf, 'C_s')]
 
     cycles_completed = 0
@@ -627,18 +655,22 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         nonlocal produce_time_s
         conversion_profile.clear()
         conversion_profile.append(0.0)
+        temperature_profile.clear()
+        temperature_profile.append(config.T_inlet_K)
         theta_C_tos.clear()
         theta_C_tos.append(_coverage(surf, 'C_s'))
         for _ in range(n_stages):
             reactor = ct.IdealGasReactor(gas)
             reactor.volume = stage_volume
+            _disable_reactor_energy(reactor)
             if surf is not None:
                 ct.ReactorSurface(surf, reactor, A=sv_ratio * stage_volume)
             net = ct.ReactorNet([reactor])
             net.advance(tau_stage)
             gas.TPX = reactor.thermo.T, reactor.thermo.P, reactor.thermo.X
             produce_time_s += tau_stage
-            conversion_profile.append(_ch4_extent(gas))
+            conversion_profile.append(_ch4_extent(gas, ch4_initial, ar_initial))
+            temperature_profile.append(float(gas.T))
             theta_C_tos.append(_coverage(surf, 'C_s'))
 
     # One produce pass (always). Optional discrete regen cycles if configured.
@@ -679,12 +711,15 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         'single_pass_CH4_conversion': float(
             per_cycle_conversion[0] if per_cycle_conversion else final_conv),
         'CH4_mole_fraction_drop': _mole_fraction_drop(gas, ch4_initial),
-        'conversion_basis': 'ch4_to_c_2h2_mole_balance',
+        'conversion_basis': 'argon_tracer',
+        'thermal_mode': 'isothermal_energy_disabled',
         'per_cycle_CH4_conversion': per_cycle_conversion,
         'regen_cycles_completed': cycles_completed,
         'exit_x_H2': x_h2,
+        'exit_T_K': float(gas.T),
         'z_positions': z_positions.tolist(),
         'conversion_profile': conversion_profile,
+        'temperature_profile': temperature_profile,
         'theta_C_time_on_stream': theta_C_tos,
         'theta_C_profile_basis': 'single_shared_surface_cumulative_time_on_stream',
         'theta_C_axial': theta_C_tos,
@@ -705,6 +740,7 @@ def _integrate_fluidized_pass(gas, surf, tau: float, sv_ratio: float,
     """Advance emulsion residence with C_s removal *during* integrate (B2)."""
     reactor_em = ct.IdealGasReactor(gas)
     reactor_em.volume = 1.0
+    _disable_reactor_energy(reactor_em)
     if surf is not None:
         ct.ReactorSurface(surf, reactor_em, A=sv_ratio)
     net = ct.ReactorNet([reactor_em])
@@ -738,6 +774,8 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
     gas, _graphite, surf = _load_gas_and_surface(config)
     gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
     ch4_initial = _species_x(gas, 'CH4') or 1.0
+    ar_initial = _species_x(gas, 'Ar')
+    _require_ar_tracer(ch4_initial, ar_initial)
 
     u0 = max(config.gas_velocity_m_s, 0.05)
     umf = config.u_mf_m_s
@@ -755,7 +793,7 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
 
     if not circulating:
         theta = _coverage(surf, 'C_s')
-        per_cycle.append(_ch4_extent(gas))
+        per_cycle.append(_ch4_extent(gas, ch4_initial, ar_initial))
         while (config.max_regen_cycles > 0
                and regen_cycles < config.max_regen_cycles
                and theta >= config.regen_coverage_threshold):
@@ -767,9 +805,9 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
                 gas, surf, tau_emulsion, sv_ratio, 0.0)
             theta = _coverage(surf, 'C_s')
             regen_cycles += 1
-            per_cycle.append(_ch4_extent(gas))
+            per_cycle.append(_ch4_extent(gas, ch4_initial, ar_initial))
 
-    final_conv = _ch4_extent(gas)
+    final_conv = _ch4_extent(gas, ch4_initial, ar_initial)
     x_h2 = _species_x(gas, 'H2')
 
     result = {
@@ -786,8 +824,10 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
         'CH4_conversion': float(final_conv),
         'single_pass_CH4_conversion': float(final_conv),
         'CH4_mole_fraction_drop': _mole_fraction_drop(gas, ch4_initial),
-        'conversion_basis': 'ch4_to_c_2h2_mole_balance',
+        'conversion_basis': 'argon_tracer',
+        'thermal_mode': 'isothermal_energy_disabled',
         'exit_x_H2': float(x_h2),
+        'exit_T_K': float(gas.T),
         'exit_theta_C': _coverage(surf, 'C_s'),
         'carbon_removed_coverage_proxy': float(carbon_removed),
         'regen_cycles_completed': regen_cycles,
@@ -824,8 +864,11 @@ def _mock_reactor_result(config: ReactorConfig, reactor_type: str) -> Dict:
         'CH4_conversion': conversion,
         'single_pass_CH4_conversion': conversion,
         'conversion_basis': (
-            'melt_ode_to_Xeq' if reactor_type == 'MMBCR'
-            else 'ch4_to_c_2h2_mole_balance'),
+            'melt_ode_to_Xeq' if reactor_type == 'MMBCR' else 'argon_tracer'),
+        'thermal_mode': (
+            'isothermal_by_construction' if reactor_type == 'MMBCR'
+            else 'isothermal_energy_disabled'),
+        'exit_T_K': config.T_inlet_K,
         **kinetics_fields(config),
         'H2_atom_balance': 0.95,
         'H2_selectivity': 0.95,

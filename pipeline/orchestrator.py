@@ -252,7 +252,10 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         )
         save_json(scorecard, 'phase2_solids_scorecard.json', subdir='reactor')
         log_solids_scorecard(scorecard, logger)
-        judge_name = scorecard.get('judge_catalyst') or 'best_non_h_parked'
+        judge_name = (
+            scorecard.get('judge_catalyst')
+            or scorecard.get('headline_catalyst')
+            or 'best_non_h_parked')
         pipeline_state['phase2'] = {
             'n_simulations': len(reactor_results),
             'elapsed_s': time.time() - t2,

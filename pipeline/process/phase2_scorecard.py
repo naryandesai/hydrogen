@@ -82,42 +82,38 @@ def build_solids_scorecard(results, *,
         and r.get('reactor_type') == 'MMBCR'
         and not r.get('mock', False)
     ]
+    eligible = [r for r in solids if not r['h_parked']]
     judge_rows = (
         [r for r in solids if r['catalyst_name'] == judge_catalyst]
         if judge_catalyst else []
     )
-    judge_reason = (
-        'named judge catalyst; not 0.01 eV H-parked; '
-        'MMBCR X_eq is not a solids rank'
-        if judge_catalyst else
-        'best non-H-parked solids; MMBCR X_eq is not a solids rank'
-    )
+    named_present = bool(judge_rows)
+    if named_present:
+        pool = judge_rows
+        rank_key = _t_k
+        judge_reason = (
+            'named judge catalyst; not 0.01 eV H-parked; '
+            'MMBCR X_eq is not a solids rank')
+    else:
+        pool = eligible
+        rank_key = lambda r: r['single_pass_CH4_conversion']
+        if judge_catalyst:
+            judge_reason = (
+                f'{judge_catalyst} missing from solids results; '
+                'headline is best non-H-parked; MMBCR X_eq is not a rank')
+        else:
+            judge_reason = (
+                'no named judge; headline is best non-H-parked; '
+                'MMBCR X_eq is not a solids rank')
+
     headline = {}
     for reactor_type in ('PFR', 'Fluidized'):
-        pool = judge_rows if judge_rows else [
-            r for r in solids if not r['h_parked']
-        ]
         candidates = [
             r for r in pool
             if r['reactor_type'] == reactor_type and _t_k(r) >= headline_t_min
         ]
         if candidates:
-            key = _t_k if judge_rows else (lambda r: r['single_pass_CH4_conversion'])
-            headline[reactor_type] = max(candidates, key=key)
-
-    eligible = [r for r in solids if not r['h_parked']]
-    if judge_catalyst and not judge_rows:
-        judge_reason += f'; {judge_catalyst} missing, used best non-H-parked solids'
-        for reactor_type in ('PFR', 'Fluidized'):
-            if reactor_type in headline:
-                continue
-            candidates = [
-                r for r in eligible
-                if r['reactor_type'] == reactor_type and _t_k(r) >= headline_t_min
-            ]
-            if candidates:
-                headline[reactor_type] = max(
-                    candidates, key=lambda r: r['single_pass_CH4_conversion'])
+            headline[reactor_type] = max(candidates, key=rank_key)
 
     solids_max = (
         max(eligible, key=lambda r: r['single_pass_CH4_conversion'])
@@ -134,16 +130,15 @@ def build_solids_scorecard(results, *,
     elif headline.get('Fluidized'):
         judge_x = headline['Fluidized']['single_pass_CH4_conversion']
 
-    resolved_judge = None
+    headline_catalyst = None
     if headline.get('PFR'):
-        resolved_judge = headline['PFR']['catalyst_name']
+        headline_catalyst = headline['PFR']['catalyst_name']
     elif headline.get('Fluidized'):
-        resolved_judge = headline['Fluidized']['catalyst_name']
-    elif judge_rows:
-        resolved_judge = judge_catalyst
+        headline_catalyst = headline['Fluidized']['catalyst_name']
 
     return {
-        'judge_catalyst': resolved_judge,
+        'judge_catalyst': judge_catalyst if named_present else None,
+        'headline_catalyst': headline_catalyst,
         'judge_catalyst_requested': judge_catalyst,
         'judge_reason': judge_reason,
         'headline_t_min': float(headline_t_min),

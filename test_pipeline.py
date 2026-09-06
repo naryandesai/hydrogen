@@ -1461,26 +1461,34 @@ def test_solids_scorecard_judges_cat_9_not_h_parked():
     assert card['solids_max_excluding_h_parked']['catalyst_name'] == 'cat_9'
     unnamed = build_solids_scorecard([h_parked, judge, fluid, melt])
     assert unnamed['judge_catalyst_requested'] is None
-    assert unnamed['judge_catalyst'] == 'cat_9'
+    assert unnamed['judge_catalyst'] is None
+    assert unnamed['headline_catalyst'] == 'cat_9'
 
 
-def test_ch4_conversion_is_mole_balance_not_mole_fraction_drop():
-    from pipeline.process.equilibrium_check import ch4_conversion_from_mole_fractions
-    # Pure CH4 → C(s)+2H2: x_CH4=(1-X)/(1+X), x_H2=2X/(1+X).
-    for X in (0.0, 0.01, 0.5, 0.985):
-        x_ch4 = (1.0 - X) / (1.0 + X)
-        x_h2 = 2.0 * X / (1.0 + X)
-        got = ch4_conversion_from_mole_fractions(x_ch4, x_h2)
-        assert abs(got - X) < 1e-12, (X, got)
-        inherited = 1.0 - x_ch4 / 1.0
-        if X > 0:
-            assert inherited > got
-            assert abs(inherited - 2.0 * X / (1.0 + X)) < 1e-12
-    # Ar diluent cancels: same X.
+def test_ch4_conversion_uses_argon_tracer_when_c2_present():
+    from pipeline.process.equilibrium_check import (
+        ch4_conversion_from_argon_tracer, ch4_conversion_from_mole_fractions)
+    # Feed CH4:0.95 / Ar:0.05. Solid route p, C2 route q (each CH4 → 0.5 C2H6 + 0.5 H2).
+    x_ch4_0, x_ar_0 = 0.95, 0.05
+    p, q = 0.00, 0.10
+    n_ch4_0, n_ar = 0.95, 0.05
+    n_ch4 = n_ch4_0 * (1.0 - p - q)
+    n_c2h6 = 0.5 * n_ch4_0 * q
+    n_h2 = 2.0 * n_ch4_0 * p + 0.5 * n_ch4_0 * q
+    n_tot = n_ch4 + n_c2h6 + n_h2 + n_ar
+    true_x = p + q
+    got = ch4_conversion_from_argon_tracer(
+        n_ch4 / n_tot, n_ar / n_tot, x_ch4_0, x_ar_0)
+    assert abs(got - true_x) < 1e-12, (got, true_x)
+    wrong = ch4_conversion_from_mole_fractions(n_ch4 / n_tot, n_h2 / n_tot)
+    assert wrong < true_x - 0.05
+    # Pure CH4/H2/Ar still recovers X on the H2 formula.
     X = 0.5
-    n_ch4, n_h2, n_ar = 0.5, 1.0, 0.05
+    n_ch4, n_h2, n_ar = 0.475, 0.95, 0.05
     n_tot = n_ch4 + n_h2 + n_ar
     assert abs(ch4_conversion_from_mole_fractions(n_ch4 / n_tot, n_h2 / n_tot) - X) < 1e-12
+    assert abs(ch4_conversion_from_argon_tracer(
+        n_ch4 / n_tot, n_ar / n_tot, 0.95, 0.05) - X) < 1e-12
 
 
 def test_mmbcr_k0_and_flotation_fail_closed():
@@ -1489,13 +1497,13 @@ def test_mmbcr_k0_and_flotation_fail_closed():
     try:
         _validate_carbon_policy(ReactorConfig(mmbcr_interfacial_k0_m_s=0.0))
     except ValueError as exc:
-        assert 'prefactor' in str(exc)
+        assert 'guardrail' in str(exc)
     else:
         raise AssertionError('k0=0 must fail closed')
     try:
         _validate_carbon_policy(ReactorConfig(mmbcr_interfacial_k0_m_s=5.0))
     except ValueError as exc:
-        assert 'prefactor' in str(exc)
+        assert 'guardrail' in str(exc)
     else:
         raise AssertionError('huge k0 must fail closed')
     try:
@@ -1758,7 +1766,7 @@ if __name__ == '__main__':
     test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
     test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
     test("Solids scorecard takes named judge as argument", test_solids_scorecard_judges_cat_9_not_h_parked)
-    test("CH4 conversion is mole balance", test_ch4_conversion_is_mole_balance_not_mole_fraction_drop)
+    test("CH4 conversion uses Ar tracer", test_ch4_conversion_uses_argon_tracer_when_c2_present)
     test("MMBCR k0 and flotation fail closed", test_mmbcr_k0_and_flotation_fail_closed)
     test("Staged sweep keeps coarse and proposes ROI", test_staged_sweep_preserves_coarse_and_proposes_roi)
     test("Oxidative regen requires co2_permitted", test_oxidative_regen_requires_co2_permitted)

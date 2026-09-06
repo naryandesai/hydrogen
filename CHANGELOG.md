@@ -4,11 +4,13 @@
 
 ### 2026-09-06 — Solids X mole balance, wired melt flotation
 
-PFR/fluidized `CH4_conversion` is now `1 - x_CH4/(x_CH4 + 0.5 x_H2)` (same as `equilibrium_check`). The inherited `1 - x_CH4/x_CH4,0` is kept as `CH4_mole_fraction_drop` only; it is `2X/(1+X)` and inflated the solids baseline versus MMBCR.
+PFR/fluidized `CH4_conversion` is the Ar-tracer ratio `1 - (x_CH4/x_Ar)/(x_CH4,0/x_Ar,0)`. The H2 mole-balance is exact only for CH4/H2/inert (equilibrium check). The solids YAML has an active C2 chain, so that denominator deflates bed X in the low-Da regime. `1 - x_CH4/x_CH4,0` remains `CH4_mole_fraction_drop` only.
 
-`mmbcr_carbon_removal_rate_1_s` is a flotation frequency (default `None` = unconstrained). `0` fouls the interface. Detachment ablation labels PFR as not wired (discrete regen only). Circulating fluidized removal runs during integrate substeps (B2 slice).
+PFR/fluidized disable the Cantera energy equation (`thermal_mode=isothermal_energy_disabled`) so they match isothermal MMBCR instead of running adiabatic and self-quenching. Exit T is reported. Melt wall-loss / interface sag is still a separate duty account, not “no energy balance.”
 
-Melt `k0` has the same fail-closed style as solids loading: `(0, 1]` m/s, cited as a calibrated prefactor (B3). Scorecard `cat_9` is a campaign argument, not a module constant. PFR `theta_C_axial` is labeled time-on-stream. MMBCR no longer reports fake C2 / `solid_C_selectivity=1`.
+`mmbcr_carbon_removal_rate_1_s` is a flotation frequency. Production default is `None` = unconstrained (`η = 1`); the knob is wired but off. `0` fouls the interface. Detachment ablation labels PFR as not wired (discrete regen only). Circulating fluidized removal runs during integrate substeps (B2 slice).
+
+Melt `k0 ≤ 1` m/s is a **guardrail** against inventing Da, not a physical bound like loading ≤ 1. Scorecard `judge_catalyst` is set only when a named judge is present; otherwise `headline_catalyst` is the best non-H-parked row. PFR `theta_C_axial` is labeled time-on-stream. MMBCR no longer reports fake C2 / `solid_C_selectivity=1`.
 
 ### 2026-09-06 — Phase 2 carbon model, phase admissibility, MMBCR rate form
 

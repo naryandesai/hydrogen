@@ -23,17 +23,32 @@ TABULATED_X_CH4_1BAR = {
 
 
 def ch4_conversion_from_mole_fractions(x_ch4: float, x_h2: float) -> float:
-    """Extent of CH4 → C(s) + 2 H2 from gas mole fractions.
+    """Extent of CH4 → C(s) + 2 H2 from a CH4/H2/inert gas.
 
-    Inherited ``1 - x_CH4 / x_CH4,0`` is not X. At constant P, moles grow,
-    so that expression is ``2X / (1 + X)`` for a CH4/H2 mixture (Ar cancels).
-    H-parked paths that make no H2 return ~0: there is no gas-phase pyrolysis
-    extent to report.
+    Exact only when H2 comes from that stoichiometry. The solids mechanism
+    has an active C2 chain; do not use this for PFR/fluidized. Those use
+    ``ch4_conversion_from_argon_tracer``.
     """
     denom = float(x_ch4) + 0.5 * float(x_h2)
     if denom <= 0:
         return 0.0
     return float(min(1.0, max(0.0, 1.0 - float(x_ch4) / denom)))
+
+
+def ch4_conversion_from_argon_tracer(x_ch4: float, x_ar: float,
+                                     x_ch4_feed: float, x_ar_feed: float) -> float:
+    """CH4 conversion from an inert Ar tracer. Exact for any gas-C fate.
+
+    X = 1 - (x_CH4/x_Ar) / (x_CH4,0/x_Ar,0). Carbon to C(s) or C2 does not
+    change Ar moles, so mole expansion and the C2 chain cancel.
+    """
+    if x_ar_feed <= 0 or x_ar <= 0 or x_ch4_feed <= 0:
+        raise ValueError(
+            'Ar tracer conversion requires Ar in the feed and the current gas; '
+            'solids reactors must keep an inert mole-fraction tracer')
+    ratio0 = float(x_ch4_feed) / float(x_ar_feed)
+    ratio = float(x_ch4) / float(x_ar)
+    return float(min(1.0, max(0.0, 1.0 - ratio / ratio0)))
 
 
 def _ch4_conversion_from_mix(gas, ch4_initial_moles: float, graphite_moles: float) -> float:
