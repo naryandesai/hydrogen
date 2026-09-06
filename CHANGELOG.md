@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### 2026-09-06 — Solids X mole balance, wired melt flotation
+
+PFR/fluidized `CH4_conversion` is now `1 - x_CH4/(x_CH4 + 0.5 x_H2)` (same as `equilibrium_check`). The inherited `1 - x_CH4/x_CH4,0` is kept as `CH4_mole_fraction_drop` only; it is `2X/(1+X)` and inflated the solids baseline versus MMBCR.
+
+`mmbcr_carbon_removal_rate_1_s` is a flotation frequency (default `None` = unconstrained). `0` fouls the interface. Detachment ablation labels PFR as not wired (discrete regen only). Circulating fluidized removal runs during integrate substeps (B2 slice).
+
+Melt `k0` has the same fail-closed style as solids loading: `(0, 1]` m/s, cited as a calibrated prefactor (B3). Scorecard `cat_9` is a campaign argument, not a module constant. PFR `theta_C_axial` is labeled time-on-stream. MMBCR no longer reports fake C2 / `solid_C_selectivity=1`.
+
 ### 2026-09-06 — Phase 2 carbon model, phase admissibility, MMBCR rate form
 
 Shipped working-tree changes. Durable rule: [ADR 0001](docs/adr/0001-pyrolysis-phase-admissibility.md). Open work: issues B1–B5.

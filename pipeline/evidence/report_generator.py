@@ -135,9 +135,10 @@ def generate_full_report(pipeline_state: Dict = None) -> Path:
     if not isinstance(solids_x, (int, float)) and isinstance(p2.get('solids_scorecard'), dict):
         solids_x = p2['solids_scorecard'].get('headline_solids_conversion')
     if isinstance(solids_x, (int, float)):
-        r(f"| Solids judge CH₄ conversion (cat_9 PFR) | {solids_x:.2%} |")
+        judge = (p2.get('solids_scorecard') or {}).get('judge_catalyst') or 'solids'
+        r(f"| Solids judge CH₄ conversion ({judge} PFR) | {solids_x:.2%} |")
     else:
-        r("| Solids judge CH₄ conversion (cat_9 PFR) | N/A |")
+        r("| Solids judge CH₄ conversion (PFR) | N/A |")
     mmbcr_x = p2.get('mmbcr_max_conversion')
     if not isinstance(mmbcr_x, (int, float)) and isinstance(p2.get('solids_scorecard'), dict):
         mmbcr_x = p2['solids_scorecard'].get('mmbcr_max_conversion')
@@ -196,7 +197,8 @@ def generate_full_report(pipeline_state: Dict = None) -> Path:
     scorecard = p2.get('solids_scorecard') or load_json(
         'phase2_solids_scorecard.json', subdir='reactor') or {}
     if scorecard.get('headline'):
-        r("Solids judged on **cat_9** (single-pass X, `a`, WHSV, ΔP). "
+        judge = scorecard.get('judge_catalyst') or 'best non-H-parked solids'
+        r(f"Solids judged on **{judge}** (single-pass X, `a`, WHSV, ΔP). "
           "MMBCR X_eq and 0.01 eV H-parked cats are not ranks.\n")
         r("| Reactor | Catalyst | T (K) | Single-pass X | a (m⁻¹) | WHSV (h⁻¹) | ΔP (bar) |")
         r("|---------|----------|-------|---------------|---------|------------|----------|")

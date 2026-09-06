@@ -1,16 +1,17 @@
-"""B1-5 Phase 2 solids scorecard.
+"""Phase 2 solids scorecard.
 
-Reports single-pass X, active a, WHSV, and Ergun ΔP. Solids are judged on
-cat_9 (modest |dE_H|). 0.01 eV H-parked cats and MMBCR X_eq are not ranks.
+Reports single-pass X, active a, WHSV, and Ergun ΔP. H-parked 0.01 eV
+cats and MMBCR X_eq are not ranks. A named judge catalyst is a campaign
+argument, not a module constant.
 """
 
 from __future__ import annotations
 
-JUDGE_CATALYST = 'cat_9'
 SOLIDS_TYPES = frozenset({'PFR', 'Fluidized'})
 H_PARKED_E_ACT_MAX = 0.05
 H_PARKED_ABS_DEH_MIN = 2.0
-HEADLINE_T_MIN = 1200.0
+# High-T end of the standard 4-point pyrolysis sweep. Campaigns may override.
+DEFAULT_HEADLINE_T_MIN = 1200.0
 
 
 def is_h_parked(record: dict) -> bool:
@@ -71,7 +72,9 @@ def metric_row(record: dict) -> dict:
     }
 
 
-def build_solids_scorecard(results) -> dict:
+def build_solids_scorecard(results, *,
+                           judge_catalyst: str | None = None,
+                           headline_t_min: float = DEFAULT_HEADLINE_T_MIN) -> dict:
     solids = [metric_row(r) for r in results if is_solids_run(r)]
     mmbcr = [
         r for r in results
@@ -79,27 +82,38 @@ def build_solids_scorecard(results) -> dict:
         and r.get('reactor_type') == 'MMBCR'
         and not r.get('mock', False)
     ]
-    judge_rows = [r for r in solids if r['catalyst_name'] == JUDGE_CATALYST]
+    judge_rows = (
+        [r for r in solids if r['catalyst_name'] == judge_catalyst]
+        if judge_catalyst else []
+    )
     judge_reason = (
-        'modest |dE_H| probe; not 0.01 eV H-parked; '
+        'named judge catalyst; not 0.01 eV H-parked; '
         'MMBCR X_eq is not a solids rank'
+        if judge_catalyst else
+        'best non-H-parked solids; MMBCR X_eq is not a solids rank'
     )
     headline = {}
     for reactor_type in ('PFR', 'Fluidized'):
+        pool = judge_rows if judge_rows else [
+            r for r in solids if not r['h_parked']
+        ]
         candidates = [
-            r for r in judge_rows
-            if r['reactor_type'] == reactor_type and _t_k(r) >= HEADLINE_T_MIN
+            r for r in pool
+            if r['reactor_type'] == reactor_type and _t_k(r) >= headline_t_min
         ]
         if candidates:
-            headline[reactor_type] = max(candidates, key=_t_k)
+            key = _t_k if judge_rows else (lambda r: r['single_pass_CH4_conversion'])
+            headline[reactor_type] = max(candidates, key=key)
 
     eligible = [r for r in solids if not r['h_parked']]
-    if not headline:
-        judge_reason += '; cat_9 missing, used best non-H-parked solids'
+    if judge_catalyst and not judge_rows:
+        judge_reason += f'; {judge_catalyst} missing, used best non-H-parked solids'
         for reactor_type in ('PFR', 'Fluidized'):
+            if reactor_type in headline:
+                continue
             candidates = [
                 r for r in eligible
-                if r['reactor_type'] == reactor_type and _t_k(r) >= HEADLINE_T_MIN
+                if r['reactor_type'] == reactor_type and _t_k(r) >= headline_t_min
             ]
             if candidates:
                 headline[reactor_type] = max(
@@ -109,7 +123,7 @@ def build_solids_scorecard(results) -> dict:
         max(eligible, key=lambda r: r['single_pass_CH4_conversion'])
         if eligible else None
     )
-    h_parked = [r for r in solids if r['h_parked'] and _t_k(r) >= HEADLINE_T_MIN]
+    h_parked = [r for r in solids if r['h_parked'] and _t_k(r) >= headline_t_min]
     mmbcr_max = max(
         (float(r.get('CH4_conversion') or 0.0) for r in mmbcr),
         default=None,
@@ -120,9 +134,19 @@ def build_solids_scorecard(results) -> dict:
     elif headline.get('Fluidized'):
         judge_x = headline['Fluidized']['single_pass_CH4_conversion']
 
+    resolved_judge = None
+    if headline.get('PFR'):
+        resolved_judge = headline['PFR']['catalyst_name']
+    elif headline.get('Fluidized'):
+        resolved_judge = headline['Fluidized']['catalyst_name']
+    elif judge_rows:
+        resolved_judge = judge_catalyst
+
     return {
-        'judge_catalyst': JUDGE_CATALYST if judge_rows else None,
+        'judge_catalyst': resolved_judge,
+        'judge_catalyst_requested': judge_catalyst,
         'judge_reason': judge_reason,
+        'headline_t_min': float(headline_t_min),
         'headline': headline,
         'headline_solids_conversion': judge_x,
         'solids_max_excluding_h_parked': solids_max,

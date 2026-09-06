@@ -3,7 +3,7 @@
 **Acceptance**
 
 - Mechanical / consumable outfeed is the default solids carbon policy. Oxidative regen remains locked unless `co2_permitted=True`.
-- Circulating fluidized carbon removal acts **during** integration, not after `net.advance()`.
+- Circulating fluidized carbon removal acts **during** integration, not after `net.advance()`. **Shipped:** `simulate_fluidized_bed` substeps and applies `circulating_carbon_removal_rate_1_s` between them. PFR is still discrete regen only.
 - Reported metrics distinguish single-pass X from cycle-averaged production.
 - Default `max_regen_cycles >= 1` is not sufficient by itself: outfeed restores sites **between** passes; inventory **during** a pass is B1.
 

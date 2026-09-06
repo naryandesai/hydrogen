@@ -5,7 +5,8 @@ Cantera Reactor-Scale Simulation Models for Methane Pyrolysis.
 
 Three reactor archetypes with distinct carbon-handling physics:
   A. MMBCR — continuous buoyant/transport carbon removal (steady; no site lattice claim)
-  B. PFR — axial coking front; optional discrete non-oxidative regen
+  B. PFR — one shared surface marched through stages (time-on-stream, not axial);
+     optional discrete non-oxidative regen
   C. Fluidized — explicit batch_regen vs circulating mode
 
 Solid carbon is never a gas-phase species. Surface C_s blocks sites on solid
@@ -45,6 +46,16 @@ ALLOWED_FLUIDIZED = frozenset({FLUIDIZED_BATCH, FLUIDIZED_CIRCULATING})
 
 # Packed-bed ΔP flag (B4). Cells above this are still run and marked.
 ERGUN_DP_LIMIT_PA = 101325.0
+
+# Melt-side interfacial prefactor (B3). Order-of-magnitude bubble-interface
+# velocity, not a DFT barrier and not a Upham-fitted mass-transfer k.
+# Upham 2017; Chen 2023; Abdollahi 2024. Cap prevents inventing Da.
+MMBCR_INTERFACIAL_K0_DEFAULT = 0.01
+MMBCR_INTERFACIAL_K0_MAX = 1.0
+# None = unconstrained flotation (carbon leaves as produced). 0 = fouled
+# interface. Finite = k_float / (k_float + k_if * a) on the ODE.
+MMBCR_FLOTATION_UNCONSTRAINED = None
+FLUIDIZED_REMOVAL_SUBSTEPS = 20
 
 # Production solids particle size (B1-3). ROI map: last Ergun-legal
 # envelope cell with margin is 0.10 mm (0.67 bar); 0.08 mm fails.
@@ -116,8 +127,9 @@ class ReactorConfig:
     # --- Carbon handling (reactor-specific; not one shared "decoke" flag) ---
     # MMBCR: bubble S/V + flotation. Interfacial k0 [m/s] is a melt-side
     # prefactor (not DFT). Carbon does not occupy a solid site lattice.
-    mmbcr_carbon_removal_rate_1_s: float = 1.0
-    mmbcr_interfacial_k0_m_s: float = 0.01
+    # Removal rate is flotation frequency [1/s]; None = unconstrained.
+    mmbcr_carbon_removal_rate_1_s: Optional[float] = MMBCR_FLOTATION_UNCONSTRAINED
+    mmbcr_interfacial_k0_m_s: float = MMBCR_INTERFACIAL_K0_DEFAULT
     # PFR / batch fluidized: produce → mechanical outfeed/clear → return.
     regen_coverage_threshold: float = 0.8
     regen_mechanism: str = REGEN_MECHANICAL
@@ -151,6 +163,17 @@ def _validate_carbon_policy(config: ReactorConfig) -> None:
         raise ValueError(
             f'metal_dispersion={config.metal_dispersion} must be in (0, 1]; '
             'do not invent area above geometric')
+    if not (0.0 < config.mmbcr_interfacial_k0_m_s <= MMBCR_INTERFACIAL_K0_MAX):
+        raise ValueError(
+            f'mmbcr_interfacial_k0_m_s={config.mmbcr_interfacial_k0_m_s} '
+            f'must be in (0, {MMBCR_INTERFACIAL_K0_MAX}]; '
+            'k0 is a calibrated melt-side prefactor, not a DFT / Da knob (B3)')
+    if (config.mmbcr_carbon_removal_rate_1_s is not None
+            and config.mmbcr_carbon_removal_rate_1_s < 0.0):
+        raise ValueError(
+            'mmbcr_carbon_removal_rate_1_s must be None (unconstrained) or >= 0')
+    if config.circulating_carbon_removal_rate_1_s < 0.0:
+        raise ValueError('circulating_carbon_removal_rate_1_s must be >= 0')
 
 
 def _mechanism_metadata(config: ReactorConfig) -> dict:
@@ -196,13 +219,20 @@ def _policy_metadata(config: ReactorConfig) -> Dict:
         'regen_mechanism': config.regen_mechanism,
         'max_regen_cycles': int(config.max_regen_cycles),
         'regen_coverage_threshold': float(config.regen_coverage_threshold),
-        'mmbcr_carbon_removal_rate_1_s': float(config.mmbcr_carbon_removal_rate_1_s),
+        'mmbcr_carbon_removal_rate_1_s': config.mmbcr_carbon_removal_rate_1_s,
+        'mmbcr_carbon_removal_role': 'interface_flotation_frequency_1_s',
+        'mmbcr_flotation': _mmbcr_flotation_label(config),
+        'mmbcr_carbon_removal_wired': True,
         'fluidized_mode': config.fluidized_mode,
         'circulating_carbon_removal_rate_1_s': float(
             config.circulating_carbon_removal_rate_1_s),
+        'circulating_carbon_removal_when': 'during_integrate_substeps',
         'carbon_phase_model': 'condensed_graphite_plus_surface_C_s',
         'mmbcr_rate_model': 'bubble_area_flotation',
         'mmbcr_interfacial_k0_m_s': float(config.mmbcr_interfacial_k0_m_s),
+        'mmbcr_interfacial_k0_basis': (
+            'calibrated melt-side prefactor; not DFT or Upham-fitted k; '
+            'B3; Upham 2017; Chen 2023; Abdollahi 2024'),
         'h2_metric_note': (
             'H2_atom_balance is not branching selectivity; lumped mechanism '
             'has no C2 competition branch for true H2 selectivity'),
@@ -417,6 +447,40 @@ def _mmbcr_interfacial_k_m_s(E_act_eV: float, T_K: float, k0_m_s: float) -> floa
     return float(k0_m_s * np.exp(-E_act_eV / max(k_B_eV * T_K, 1e-12)))
 
 
+def _mmbcr_flotation_label(config: ReactorConfig) -> str:
+    rate = config.mmbcr_carbon_removal_rate_1_s
+    if rate is None:
+        return 'unconstrained'
+    if rate <= 0.0:
+        return 'blocked'
+    return 'finite'
+
+
+def _mmbcr_flotation_eta(k_if_m_s: float, sv_ratio_1_m: float,
+                         k_float_1_s: Optional[float]) -> float:
+    """Available-interface factor. None = unconstrained; 0 = fouled."""
+    if k_float_1_s is None:
+        return 1.0
+    if k_float_1_s <= 0.0:
+        return 0.0
+    denom = k_float_1_s + max(k_if_m_s, 0.0) * max(sv_ratio_1_m, 0.0)
+    if denom <= 0:
+        return 0.0
+    return float(k_float_1_s / denom)
+
+
+def _ch4_extent(gas) -> float:
+    from pipeline.process.equilibrium_check import ch4_conversion_from_mole_fractions
+    return ch4_conversion_from_mole_fractions(
+        _species_x(gas, 'CH4'), _species_x(gas, 'H2'))
+
+
+def _mole_fraction_drop(gas, x_ch4_feed: float) -> float:
+    if x_ch4_feed <= 0:
+        return 0.0
+    return float(max(0.0, 1.0 - _species_x(gas, 'CH4') / x_ch4_feed))
+
+
 def _set_gas_from_ch4_conversion(gas, T_K: float, P_Pa: float,
                                  x_ch4_feed: float, x_ar_feed: float, X: float):
     """CH4 → C(s) + 2 H2; C leaves the bubble by flotation (not in the gas)."""
@@ -454,7 +518,9 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
     x_eq = _tabulated_x_eq(config.T_inlet_K)
     k_if = _mmbcr_interfacial_k_m_s(
         config.catalyst_E_act_eV, config.T_inlet_K, config.mmbcr_interfacial_k0_m_s)
-    da_stage = k_if * sv_ratio * tau_stage
+    eta_float = _mmbcr_flotation_eta(
+        k_if, sv_ratio, config.mmbcr_carbon_removal_rate_1_s)
+    da_stage = k_if * sv_ratio * tau_stage * eta_float
 
     z_positions = np.linspace(0, config.column_height_m, config.n_cstr_stages + 1)
     conversion_profile = [0.0]
@@ -477,7 +543,6 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
 
     final_conv = conversion_profile[-1]
     x_h2 = _species_x(gas, 'H2')
-    x_c2h2, x_c2h4, x_c2h6 = (_species_x(gas, s) for s in ('C2H2', 'C2H4', 'C2H6'))
 
     result = {
         'reactor_type': 'MMBCR',
@@ -493,19 +558,22 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
         'H2_atom_balance': _h2_atom_balance_metric(x_ch4_feed, final_conv, x_h2),
         # Backward-compatible alias; not true selectivity.
         'H2_selectivity': _h2_atom_balance_metric(x_ch4_feed, final_conv, x_h2),
-        'solid_C_selectivity': _solid_c_from_balance(
-            x_ch4_feed, final_conv, x_c2h2, x_c2h4, x_c2h6),
+        'solid_C_selectivity': None,
+        'solid_C_selectivity_note': (
+            'melt reconstructs CH4/H2/Ar only; C2s are not in the bubble gas'),
+        'c2_tracked': False,
         'exit_x_H2': x_h2,
         'exit_x_CH4': _species_x(gas, 'CH4'),
-        'exit_x_C2H2': x_c2h2,
-        'exit_x_C2H4': x_c2h4,
-        'exit_x_C2H6': x_c2h6,
+        'exit_x_C2H2': None,
+        'exit_x_C2H4': None,
+        'exit_x_C2H6': None,
         'exit_T_K': float(gas.T),
         'exit_theta_C': 0.0,
         'carbon_removed_coverage_proxy': float(carbon_removed_coverage),
         'X_eq_table': float(x_eq),
         'mmbcr_k_if_m_s': float(k_if),
-        'mmbcr_Da': float(k_if * sv_ratio * tau_total),
+        'mmbcr_flotation_eta': float(eta_float),
+        'mmbcr_Da': float(k_if * sv_ratio * tau_total * eta_float),
         'conversion_basis': 'melt_ode_to_Xeq',
         **kinetics_fields(config),
         'z_positions': z_positions.tolist(),
@@ -523,7 +591,7 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# B. PFR (axial coverage per stage)
+# B. PFR (one shared surface marched through stages = time-on-stream)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def simulate_pfr(config: ReactorConfig) -> Dict:
@@ -549,7 +617,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
 
     z_positions = np.linspace(0, config.bed_length_m, n_stages + 1)
     conversion_profile = [0.0]
-    theta_C_axial = [_coverage(surf, 'C_s')]
+    theta_C_tos = [_coverage(surf, 'C_s')]
 
     cycles_completed = 0
     per_cycle_conversion: List[float] = []
@@ -559,8 +627,8 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         nonlocal produce_time_s
         conversion_profile.clear()
         conversion_profile.append(0.0)
-        theta_C_axial.clear()
-        theta_C_axial.append(_coverage(surf, 'C_s'))
+        theta_C_tos.clear()
+        theta_C_tos.append(_coverage(surf, 'C_s'))
         for _ in range(n_stages):
             reactor = ct.IdealGasReactor(gas)
             reactor.volume = stage_volume
@@ -570,9 +638,8 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
             net.advance(tau_stage)
             gas.TPX = reactor.thermo.T, reactor.thermo.P, reactor.thermo.X
             produce_time_s += tau_stage
-            x_ch4 = _species_x(gas, 'CH4')
-            conversion_profile.append(1.0 - x_ch4 / ch4_initial)
-            theta_C_axial.append(_coverage(surf, 'C_s'))
+            conversion_profile.append(_ch4_extent(gas))
+            theta_C_tos.append(_coverage(surf, 'C_s'))
 
     # One produce pass (always). Optional discrete regen cycles if configured.
     gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
@@ -583,7 +650,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
 
     while (config.max_regen_cycles > 0
            and cycles_completed < config.max_regen_cycles
-           and theta_C_axial and max(theta_C_axial) >= config.regen_coverage_threshold):
+           and theta_C_tos and max(theta_C_tos) >= config.regen_coverage_threshold):
         if config.regen_mechanism == REGEN_OXIDATIVE and not config.co2_permitted:
             raise RuntimeError('oxidative regen blocked (co2_permitted=False)')
         if config.regen_mechanism == REGEN_OXIDATIVE:
@@ -611,15 +678,18 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         'CH4_conversion': float(final_conv),
         'single_pass_CH4_conversion': float(
             per_cycle_conversion[0] if per_cycle_conversion else final_conv),
-        'conversion_basis': 'single_pass',
+        'CH4_mole_fraction_drop': _mole_fraction_drop(gas, ch4_initial),
+        'conversion_basis': 'ch4_to_c_2h2_mole_balance',
         'per_cycle_CH4_conversion': per_cycle_conversion,
         'regen_cycles_completed': cycles_completed,
         'exit_x_H2': x_h2,
         'z_positions': z_positions.tolist(),
         'conversion_profile': conversion_profile,
-        'theta_C_axial': theta_C_axial,
-        'inlet_theta_C': float(theta_C_axial[1] if len(theta_C_axial) > 1 else 0.0),
-        'max_theta_C': float(max(theta_C_axial) if theta_C_axial else 0.0),
+        'theta_C_time_on_stream': theta_C_tos,
+        'theta_C_profile_basis': 'single_shared_surface_cumulative_time_on_stream',
+        'theta_C_axial': theta_C_tos,
+        'inlet_theta_C': float(theta_C_tos[1] if len(theta_C_tos) > 1 else 0.0),
+        'max_theta_C': float(max(theta_C_tos) if theta_C_tos else 0.0),
         **kinetics_fields(config),
         **solids_inventory_fields(config, geometric_sv_pfr(config)),
         **_kinetics_evidence(config),
@@ -628,6 +698,28 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
     logger.info(f"  PFR result: conversion={final_conv:.2%}, τ={tau_total:.1f}s, "
                 f"regen_cycles={cycles_completed}")
     return result
+
+
+def _integrate_fluidized_pass(gas, surf, tau: float, sv_ratio: float,
+                              removal_rate_1_s: float) -> float:
+    """Advance emulsion residence with C_s removal *during* integrate (B2)."""
+    reactor_em = ct.IdealGasReactor(gas)
+    reactor_em.volume = 1.0
+    if surf is not None:
+        ct.ReactorSurface(surf, reactor_em, A=sv_ratio)
+    net = ct.ReactorNet([reactor_em])
+    carbon_removed = 0.0
+    n = max(1, int(FLUIDIZED_REMOVAL_SUBSTEPS))
+    dt = tau / n
+    t = 0.0
+    for _ in range(n):
+        t += dt
+        net.advance(t)
+        if removal_rate_1_s > 0 and surf is not None:
+            carbon_removed += _apply_continuous_carbon_removal(
+                surf, removal_rate_1_s, dt)
+    gas.TPX = reactor_em.thermo.T, reactor_em.thermo.P, reactor_em.thermo.X
+    return carbon_removed
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -652,27 +744,18 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
     delta = min(0.5, max(0.01, (u0 - umf) / u0))
     tau_emulsion = config.bed_height_m * (1 - delta) / umf
 
-    reactor_em = ct.IdealGasReactor(gas)
-    reactor_em.volume = 1.0
     sv_ratio = active_sv(geometric_sv_fluidized(config), config)
-    if surf is not None:
-        ct.ReactorSurface(surf, reactor_em, A=sv_ratio)
+    circulating = config.fluidized_mode == FLUIDIZED_CIRCULATING
+    removal_rate = config.circulating_carbon_removal_rate_1_s if circulating else 0.0
+    carbon_removed = _integrate_fluidized_pass(
+        gas, surf, tau_emulsion, sv_ratio, removal_rate)
 
-    net = ct.ReactorNet([reactor_em])
-    net.advance(tau_emulsion)
-    gas.TPX = reactor_em.thermo.T, reactor_em.thermo.P, reactor_em.thermo.X
-
-    carbon_removed = 0.0
     regen_cycles = 0
     per_cycle = []
 
-    if config.fluidized_mode == FLUIDIZED_CIRCULATING:
-        carbon_removed = _apply_continuous_carbon_removal(
-            surf, config.circulating_carbon_removal_rate_1_s, tau_emulsion)
-    else:
-        # batch_regen: accumulate; optional discrete mechanical regen cycles
+    if not circulating:
         theta = _coverage(surf, 'C_s')
-        per_cycle.append(1.0 - _species_x(gas, 'CH4') / ch4_initial)
+        per_cycle.append(_ch4_extent(gas))
         while (config.max_regen_cycles > 0
                and regen_cycles < config.max_regen_cycles
                and theta >= config.regen_coverage_threshold):
@@ -680,21 +763,13 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
                 raise RuntimeError('oxidative regen blocked (co2_permitted=False)')
             _reset_surface_carbon(surf)
             gas.TPX = config.T_inlet_K, config.P_inlet_Pa, config.inlet_composition
-            reactor_em = ct.IdealGasReactor(gas)
-            reactor_em.volume = 1.0
-            if surf is not None:
-                ct.ReactorSurface(
-                    surf, reactor_em,
-                    A=active_sv(geometric_sv_fluidized(config), config))
-            net = ct.ReactorNet([reactor_em])
-            net.advance(tau_emulsion)
-            gas.TPX = reactor_em.thermo.T, reactor_em.thermo.P, reactor_em.thermo.X
+            carbon_removed += _integrate_fluidized_pass(
+                gas, surf, tau_emulsion, sv_ratio, 0.0)
             theta = _coverage(surf, 'C_s')
             regen_cycles += 1
-            per_cycle.append(1.0 - _species_x(gas, 'CH4') / ch4_initial)
+            per_cycle.append(_ch4_extent(gas))
 
-    final_x_ch4 = _species_x(gas, 'CH4')
-    final_conv = 1.0 - final_x_ch4 / ch4_initial
+    final_conv = _ch4_extent(gas)
     x_h2 = _species_x(gas, 'H2')
 
     result = {
@@ -710,7 +785,8 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
         'WHSV_h-1': reciprocal_residence_h(tau_emulsion),
         'CH4_conversion': float(final_conv),
         'single_pass_CH4_conversion': float(final_conv),
-        'conversion_basis': 'single_pass',
+        'CH4_mole_fraction_drop': _mole_fraction_drop(gas, ch4_initial),
+        'conversion_basis': 'ch4_to_c_2h2_mole_balance',
         'exit_x_H2': float(x_h2),
         'exit_theta_C': _coverage(surf, 'C_s'),
         'carbon_removed_coverage_proxy': float(carbon_removed),
@@ -747,7 +823,9 @@ def _mock_reactor_result(config: ReactorConfig, reactor_type: str) -> Dict:
         'WHSV_h-1': reciprocal_residence_h(tau),
         'CH4_conversion': conversion,
         'single_pass_CH4_conversion': conversion,
-        'conversion_basis': 'single_pass' if reactor_type != 'MMBCR' else 'melt_ode_to_Xeq',
+        'conversion_basis': (
+            'melt_ode_to_Xeq' if reactor_type == 'MMBCR'
+            else 'ch4_to_c_2h2_mole_balance'),
         **kinetics_fields(config),
         'H2_atom_balance': 0.95,
         'H2_selectivity': 0.95,

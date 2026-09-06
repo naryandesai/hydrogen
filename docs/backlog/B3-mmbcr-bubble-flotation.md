@@ -4,7 +4,8 @@
 
 **Acceptance (remaining)**
 
-- Interfacial `k0` and `a = 6/d` are documented as a **calibrated melt-side prefactor**, not a DFT or Upham-fitted mass-transfer coefficient.
+- Interfacial `k0` and `a = 6/d` are documented as a **calibrated melt-side prefactor**, not a DFT or Upham-fitted mass-transfer coefficient. Validator: `0 < k0 ≤ 1` m/s. Default `0.01` m/s (Upham 2017; Chen 2023; Abdollahi 2024).
+- Flotation frequency `mmbcr_carbon_removal_rate_1_s` is wired: `None` = unconstrained (production), `0` = fouled interface, finite = `η = k_float / (k_float + k_if · a)` on the ODE. It is not a Langmuir site rate.
 - Tests assert: X ≤ X_eq always; X → X_eq only when `k·a·τ` is large; X is kinetics-limited at Chen-scale E_a (~0.84 eV) on the current column.
 - Do **not** treat “E_act = 0.1 eV → X = X_eq” as evidence the kinetics are right. That is a property of `dX/dt ∝ (X_eq − X)`.
 - Cross-reactor comparison: MMBCR is pinned toward X_eq while PFR/fluidized remain Damköhler-limited, so MMBCR will systematically look better until B1/B2/B5 close on solids.

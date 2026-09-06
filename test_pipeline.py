@@ -1450,13 +1450,60 @@ def test_solids_scorecard_judges_cat_9_not_h_parked():
     }
     assert is_h_parked(h_parked)
     assert not is_h_parked(judge)
-    card = build_solids_scorecard([h_parked, judge, fluid, melt])
+    card = build_solids_scorecard(
+        [h_parked, judge, fluid, melt], judge_catalyst='cat_9')
     assert card['judge_catalyst'] == 'cat_9'
+    assert card['judge_catalyst_requested'] == 'cat_9'
     assert abs(card['headline_solids_conversion'] - 0.0102) < 1e-9
     assert card['headline']['PFR']['WHSV_h-1'] == 900.0
     assert card['headline']['Fluidized']['single_pass_CH4_conversion'] == 0.0122
     assert abs(card['mmbcr_max_conversion'] - 0.985) < 1e-9
     assert card['solids_max_excluding_h_parked']['catalyst_name'] == 'cat_9'
+    unnamed = build_solids_scorecard([h_parked, judge, fluid, melt])
+    assert unnamed['judge_catalyst_requested'] is None
+    assert unnamed['judge_catalyst'] == 'cat_9'
+
+
+def test_ch4_conversion_is_mole_balance_not_mole_fraction_drop():
+    from pipeline.process.equilibrium_check import ch4_conversion_from_mole_fractions
+    # Pure CH4 → C(s)+2H2: x_CH4=(1-X)/(1+X), x_H2=2X/(1+X).
+    for X in (0.0, 0.01, 0.5, 0.985):
+        x_ch4 = (1.0 - X) / (1.0 + X)
+        x_h2 = 2.0 * X / (1.0 + X)
+        got = ch4_conversion_from_mole_fractions(x_ch4, x_h2)
+        assert abs(got - X) < 1e-12, (X, got)
+        inherited = 1.0 - x_ch4 / 1.0
+        if X > 0:
+            assert inherited > got
+            assert abs(inherited - 2.0 * X / (1.0 + X)) < 1e-12
+    # Ar diluent cancels: same X.
+    X = 0.5
+    n_ch4, n_h2, n_ar = 0.5, 1.0, 0.05
+    n_tot = n_ch4 + n_h2 + n_ar
+    assert abs(ch4_conversion_from_mole_fractions(n_ch4 / n_tot, n_h2 / n_tot) - X) < 1e-12
+
+
+def test_mmbcr_k0_and_flotation_fail_closed():
+    from pipeline.process.reactor_models import ReactorConfig, _validate_carbon_policy
+    _validate_carbon_policy(ReactorConfig())
+    try:
+        _validate_carbon_policy(ReactorConfig(mmbcr_interfacial_k0_m_s=0.0))
+    except ValueError as exc:
+        assert 'prefactor' in str(exc)
+    else:
+        raise AssertionError('k0=0 must fail closed')
+    try:
+        _validate_carbon_policy(ReactorConfig(mmbcr_interfacial_k0_m_s=5.0))
+    except ValueError as exc:
+        assert 'prefactor' in str(exc)
+    else:
+        raise AssertionError('huge k0 must fail closed')
+    try:
+        _validate_carbon_policy(ReactorConfig(mmbcr_carbon_removal_rate_1_s=-1.0))
+    except ValueError as exc:
+        assert 'mmbcr_carbon_removal' in str(exc)
+    else:
+        raise AssertionError('negative flotation rate must fail closed')
 
 
 def test_site_density_locked_to_monolayer():
@@ -1710,6 +1757,9 @@ if __name__ == '__main__':
     test("Mechanism uses condensed graphite", test_mechanism_has_condensed_graphite_not_gas_carbon)
     test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
     test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
+    test("Solids scorecard takes named judge as argument", test_solids_scorecard_judges_cat_9_not_h_parked)
+    test("CH4 conversion is mole balance", test_ch4_conversion_is_mole_balance_not_mole_fraction_drop)
+    test("MMBCR k0 and flotation fail closed", test_mmbcr_k0_and_flotation_fail_closed)
     test("Staged sweep keeps coarse and proposes ROI", test_staged_sweep_preserves_coarse_and_proposes_roi)
     test("Oxidative regen requires co2_permitted", test_oxidative_regen_requires_co2_permitted)
     test("Prior-art novelty states", test_prior_art_registry_tracks_exact_and_region_novelty)

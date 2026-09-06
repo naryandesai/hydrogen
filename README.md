@@ -1024,9 +1024,11 @@ For each pyrolysis-admissible catalyst (`phase_stable_at_application_T`; [ADR 00
 1. Build a typed `CandidateKinetics` record from the screening row. `E_act`, H*, CH3*, and C* adsorption descriptors keep protocol provenance; missing elementary barriers are labeled `template_default`.
 2. Write a Cantera YAML with condensed `C(gr)` and a Langmuir surface ending at `C_s`. There is **no** gas-phase `C_graphite` tracer. Γ is a monolayer (`2.5×10⁻⁹ mol/cm²`); do not raise it to force Damköhler. A `.kinetics.json` sidecar records every resolved parameter.
 3. Simulate MMBCR, PFR, and circulating fluidized bed at 773.15, 900, 1100, and 1300 K, 1 bar, flowing CH₄.
-4. Report single-pass X, active `a`, WHSV (1/τ in h⁻¹), and Ergun ΔP. Judge solids on `cat_9`, not 0.01 eV H-parked cats.
+4. Report single-pass X from the CH₄ → C(s)+2H₂ mole balance (`1 - x_CH4/(x_CH4 + 0.5 x_H2)`), not `1 - x_CH4/x_CH4,0` (that is `2X/(1+X)`). Also report active `a`, WHSV (1/τ in h⁻¹), and Ergun ΔP. A named solids judge is a campaign argument; H-parked 0.01 eV cats are not ranks.
 
 **Honest status.** MMBCR rate is `k(E_act,T)·a_bubble·(X_eq−X)`. It cannot exceed X_eq and reaches X_eq for large `k·a·τ` **by construction**. The 98.5% at 1300 K is a sanity check, not kinetic closure or a catalyst rank. PFR/fluidized closure is still pending (B2, B5). Do not send Phase 2 X to DFT until that gate passes.
+
+There is **no energy balance**. MMBCR `temperature_profile` is `T_inlet` repeated; PFR stages are `IdealGasReactor` held at inlet T. CH₄ pyrolysis is ~75 kJ/mol endothermic. Wall and free-surface losses, interface T sag, and the argument that a melt needs a larger thermal inventory (bulk T pushed higher to keep the interface hot) **cannot be tested in this model**. Scorecard melt-vs-bed gaps are isothermal kinetic/inventory gaps, not a thermal-duty comparison.
 
 Solids inventory defaults (B1): `d_p = 0.13 mm`, metal loading `0.5`, dispersion `0.3`. Area law: `a = a_geom × loading × dispersion` (both ≤ 1). Open work: [`docs/backlog/`](docs/backlog/).
 

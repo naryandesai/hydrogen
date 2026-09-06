@@ -63,6 +63,10 @@ class PipelineConfig:
     quick_mode: bool = False             # Reduced parameters for testing
     pyrolysis_mode: str = 'ntec'         # 'ntec' or 'thermocatalytic'
     allow_mock_inputs: bool = False       # Explicit test-only opt-in
+    # Named solids judge is a campaign choice (pilot used cat_9). None =
+    # best non-H-parked solids at the headline T band.
+    solids_judge_catalyst: Optional[str] = None
+    solids_headline_t_min: float = 1200.0
 
 
 def run_pipeline(config: PipelineConfig = PipelineConfig(),
@@ -241,9 +245,14 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
                 )
                 reactor_results.extend(results)
 
-        scorecard = build_solids_scorecard(reactor_results)
+        scorecard = build_solids_scorecard(
+            reactor_results,
+            judge_catalyst=config.solids_judge_catalyst,
+            headline_t_min=config.solids_headline_t_min,
+        )
         save_json(scorecard, 'phase2_solids_scorecard.json', subdir='reactor')
         log_solids_scorecard(scorecard, logger)
+        judge_name = scorecard.get('judge_catalyst') or 'best_non_h_parked'
         pipeline_state['phase2'] = {
             'n_simulations': len(reactor_results),
             'elapsed_s': time.time() - t2,
@@ -253,7 +262,7 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
             },
             'solids_scorecard': scorecard,
             'best_conversion': scorecard.get('headline_solids_conversion'),
-            'best_conversion_scope': 'solids_single_pass_judge_cat_9',
+            'best_conversion_scope': f'solids_single_pass_judge_{judge_name}',
             'mmbcr_max_conversion': scorecard.get('mmbcr_max_conversion'),
         }
 

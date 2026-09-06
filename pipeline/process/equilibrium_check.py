@@ -22,6 +22,20 @@ TABULATED_X_CH4_1BAR = {
 }
 
 
+def ch4_conversion_from_mole_fractions(x_ch4: float, x_h2: float) -> float:
+    """Extent of CH4 → C(s) + 2 H2 from gas mole fractions.
+
+    Inherited ``1 - x_CH4 / x_CH4,0`` is not X. At constant P, moles grow,
+    so that expression is ``2X / (1 + X)`` for a CH4/H2 mixture (Ar cancels).
+    H-parked paths that make no H2 return ~0: there is no gas-phase pyrolysis
+    extent to report.
+    """
+    denom = float(x_ch4) + 0.5 * float(x_h2)
+    if denom <= 0:
+        return 0.0
+    return float(min(1.0, max(0.0, 1.0 - float(x_ch4) / denom)))
+
+
 def _ch4_conversion_from_mix(gas, ch4_initial_moles: float, graphite_moles: float) -> float:
     """Equilibrium conversion from remaining gas-phase carbon vs initial CH4."""
     if ch4_initial_moles <= 0:
@@ -31,16 +45,9 @@ def _ch4_conversion_from_mix(gas, ch4_initial_moles: float, graphite_moles: floa
         return float(min(1.0, max(0.0, graphite_moles / ch4_initial_moles)))
     if 'CH4' not in gas.species_names:
         return 0.0
-    n_total = gas.P * gas.volume / (gas.T * 8.314462618) if hasattr(gas, 'volume') else None
-    # Mole fractions after TP eq with changing mole count: use element balance on gas.
     x_ch4 = float(gas.X[gas.species_index('CH4')])
     x_h2 = float(gas.X[gas.species_index('H2')]) if 'H2' in gas.species_names else 0.0
-    # For CH4 → C(s)+2H2, n_gas final / n_gas init = (1+X)/(1) with pure CH4 feed;
-    # X = 1 - x_CH4 / (x_CH4 + 0.5 x_H2) when only CH4/H2 present.
-    denom = x_ch4 + 0.5 * x_h2
-    if denom <= 0:
-        return 0.0
-    return float(min(1.0, max(0.0, 1.0 - x_ch4 / denom)))
+    return ch4_conversion_from_mole_fractions(x_ch4, x_h2)
 
 
 def run_equilibrium_sweep(

@@ -130,13 +130,25 @@ def run_eact_sweep(
     return out
 
 
+# PFR clears C_s only by discrete regen. It does not read a continuous
+# detachment rate; a flat PFR pair is "not wired", not "detachment = 0".
+ABLATION_RESPONSE = {
+    'MMBCR': True,
+    'Fluidized': True,
+    'PFR': False,
+}
+
+
 def run_detachment_ablation(T_K: float = 1300.0, E_act_eV: float = 0.1) -> Dict:
     """
-    Separate carbon-thermo fix from site-detachment with correct condensed thermo.
+    Ablate continuous carbon takeoff where that knob is actually wired.
 
-    Cases (same E_act, T, geometry):
-      blocked:   continuous removal rate ~ 0 (sites fill)
-      detach:    high continuous removal (sites freed; no gas carbon)
+    MMBCR: ``mmbcr_carbon_removal_rate_1_s`` is flotation frequency.
+    0 fouls the interface; finite keeps it open.
+    Fluidized circulating: ``circulating_carbon_removal_rate_1_s`` is
+    applied during integrate (substeps), not after ``net.advance()``.
+    PFR: discrete regen only. Rows are kept with
+    ``responds_to_ablated_variable=false``.
     """
     cat = 'ablation_cat'
     mech = write_full_mechanism(cat, E_act_CH4=E_act_eV, T_ref=T_K)
@@ -170,9 +182,46 @@ def run_detachment_ablation(T_K: float = 1300.0, E_act_eV: float = 0.1) -> Dict:
                 'CH4_conversion': float(result.get('CH4_conversion', 0) or 0),
                 'exit_theta_C': result.get('exit_theta_C'),
                 'max_theta_C': result.get('max_theta_C'),
+                'responds_to_ablated_variable': ABLATION_RESPONSE[rt],
+                'ablation_note': (
+                    None if ABLATION_RESPONSE[rt] else
+                    'PFR clears C_s only by discrete regen; '
+                    'max_regen_cycles=0 so both cases are the same produce pass'
+                ),
             })
-            logger.info(f"ablation {name} {rt}: X={rows[-1]['CH4_conversion']:.4f}")
-    out = {'diagnostic': 'detachment_ablation', 'points': rows}
+            logger.info(
+                f"ablation {name} {rt}: X={rows[-1]['CH4_conversion']:.4f} "
+                f"responds={ABLATION_RESPONSE[rt]}"
+            )
+    by_rt = {}
+    for row in rows:
+        by_rt.setdefault(row['reactor_type'], {})[row['case']] = row
+    interpretations = {}
+    for rt, cases in by_rt.items():
+        blocked = cases.get('blocked_no_detach', {}).get('CH4_conversion', 0.0)
+        detach = cases.get('detach_transport_lump', {}).get('CH4_conversion', 0.0)
+        delta = float(detach) - float(blocked)
+        if not ABLATION_RESPONSE[rt]:
+            meaning = 'not_wired'
+        elif abs(delta) > 1e-4:
+            meaning = 'wired_and_limiting'
+        else:
+            meaning = 'wired_not_limiting_at_this_point'
+        interpretations[rt] = {
+            'delta_X': delta,
+            'interpretation': meaning,
+        }
+        for row in rows:
+            if row['reactor_type'] == rt:
+                row['ablation_delta_X'] = delta
+                row['ablation_interpretation'] = meaning
+    out = {
+        'diagnostic': 'detachment_ablation',
+        'points': rows,
+        'wired_reactors': [rt for rt, ok in ABLATION_RESPONSE.items() if ok],
+        'unwired_reactors': [rt for rt, ok in ABLATION_RESPONSE.items() if not ok],
+        'interpretation': interpretations,
+    }
     save_json(out, 'detachment_ablation.json', subdir='reactor')
     return out
 
