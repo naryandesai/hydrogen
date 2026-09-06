@@ -233,6 +233,8 @@ def main():
     pareto_genomes, screening_db = run_branch_discovery(branch_config)
 
     from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
+    from pipeline.screening.stage_selection import (
+        annotate_evidence, select_for_validation)
 
     valid_db = screening_db[screening_db['valid'] == True].copy()
     ranking_db = valid_db
@@ -240,13 +242,21 @@ def main():
         uncensored = ranking_db[ranking_db['E_act_censored'] != True]
         if len(uncensored):
             ranking_db = uncensored
+    evidence_db = annotate_evidence(screening_db, 'E_act')
+    admissible = select_turquoise_pyrolysis_candidates(ranking_db, top_k=None)
     top_catalysts = select_turquoise_pyrolysis_candidates(ranking_db, args.top_k)
+    dft_candidates = select_for_validation(
+        admissible, min(args.validation_batch, max(len(admissible), 1)),
+        'E_act', min_per_class=args.min_validation_per_class)
 
     pipeline_state['phase1'] = {
         'pareto_size': len(pareto_genomes),
         'total_evaluated': len(screening_db),
         'valid_count': len(valid_db),
         'top_catalysts_count': len(top_catalysts),
+        'dft_resolution_count': len(dft_candidates),
+        'candidate_dispositions': evidence_db[
+            'candidate_disposition'].value_counts().to_dict(),
         'elapsed_s': time.time() - t1,
         'search_strategy': 'deterministic_branch_and_bound',
     }

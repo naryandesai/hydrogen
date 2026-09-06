@@ -1,6 +1,6 @@
 # Phase 2 backlog
 
-Issue bodies are self-contained. File them on GitHub (`YungRaj/hydrogen`; Issues is enabled). `gh` is installed but this machine is not logged in (`gh auth login`).
+Issue bodies are self-contained. File them on the working fork (`naryandesai/hydrogen`). `gh` is installed but this machine is not logged in (`gh auth login`).
 
 Reference numbering matches [ADR 0001](../adr/0001-pyrolysis-phase-admissibility.md).
 
@@ -15,10 +15,10 @@ Reference numbering matches [ADR 0001](../adr/0001-pyrolysis-phase-admissibility
 After `gh auth login`:
 
 ```powershell
-gh milestone create "Phase 2 solids closure" --repo YungRaj/hydrogen --description "PFR and fluidized must approach X_eq on a fast catalyst before Phase 2 conversion is used for DFT."
-gh issue create --repo YungRaj/hydrogen --title "B1: Solid-catalyst site inventory without inventing Γ" --body-file docs/backlog/B1-solid-site-inventory.md --label "enhancement"
-gh issue create --repo YungRaj/hydrogen --title "B2: Solids produce → outfeed/clear → return" --body-file docs/backlog/B2-solids-outfeed-clearing.md --label "enhancement"
-gh issue create --repo YungRaj/hydrogen --title "B3: MMBCR k·a·τ is a sanity check, not kinetic closure" --body-file docs/backlog/B3-mmbcr-bubble-flotation.md --label "documentation"
-gh issue create --repo YungRaj/hydrogen --title "B4: Practical limits on lengthening the PFR" --body-file docs/backlog/B4-pfr-residence-time-limits.md --label "enhancement"
-gh issue create --repo YungRaj/hydrogen --title "B5: Do not send Phase 2 X to DFT until PFR/fluidized closure" --body-file docs/backlog/B5-phase2-x-gate-before-dft.md --label "gate" --milestone "Phase 2 solids closure"
+gh milestone create "Phase 2 solids closure" --repo naryandesai/hydrogen --description "PFR and fluidized must approach X_eq on a fast catalyst before Phase 2 conversion is used for DFT."
+gh issue create --repo naryandesai/hydrogen --title "B1: Solid-catalyst site inventory without inventing Γ" --body-file docs/backlog/B1-solid-site-inventory.md --label "enhancement"
+gh issue create --repo naryandesai/hydrogen --title "B2: Solids produce → outfeed/clear → return" --body-file docs/backlog/B2-solids-outfeed-clearing.md --label "enhancement"
+gh issue create --repo naryandesai/hydrogen --title "B3: MMBCR k·a·τ is a sanity check, not kinetic closure" --body-file docs/backlog/B3-mmbcr-bubble-flotation.md --label "documentation"
+gh issue create --repo naryandesai/hydrogen --title "B4: Practical limits on lengthening the PFR" --body-file docs/backlog/B4-pfr-residence-time-limits.md --label "enhancement"
+gh issue create --repo naryandesai/hydrogen --title "B5: Do not send Phase 2 X to DFT until PFR/fluidized closure" --body-file docs/backlog/B5-phase2-x-gate-before-dft.md --label "gate" --milestone "Phase 2 solids closure"
 ```

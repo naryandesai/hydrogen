@@ -92,6 +92,7 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
 
     pipeline_state = load_json("pipeline_state.json") or {}
     top_catalysts = None
+    dft_candidates = None
     screening_valid_db = None
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -121,16 +122,25 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
 
         # Select pyrolysis-admissible top-K (MetalHydride never proceeds).
         from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
+        from pipeline.screening.stage_selection import (
+            annotate_evidence, select_for_validation)
         valid_db = screening_db[screening_db['valid'] == True].copy()
         screening_valid_db = valid_db
+        evidence_db = annotate_evidence(screening_db, 'E_act')
+        admissible = select_turquoise_pyrolysis_candidates(valid_db, top_k=None)
         top_catalysts = select_turquoise_pyrolysis_candidates(
             valid_db, config.top_k_reactor)
+        dft_candidates = select_for_validation(
+            admissible, config.top_k_dft, 'E_act', min_per_class=1)
 
         pipeline_state['phase1'] = {
             'pareto_size': len(pareto_genomes),
             'total_evaluated': len(screening_db),
             'valid_count': len(valid_db),
             'top_catalysts_count': len(top_catalysts),
+            'dft_resolution_count': len(dft_candidates),
+            'candidate_dispositions': evidence_db[
+                'candidate_disposition'].value_counts().to_dict(),
             'elapsed_s': time.time() - t1,
         }
         if len(valid_db) > 0 and 'E_act' in valid_db.columns:
@@ -260,8 +270,13 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         from pipeline.validation.dft_validator import validate_catalyst
 
         dft_results = []
-        if top_catalysts is not None:
+        if dft_candidates is not None:
+            top_dft = dft_candidates.head(config.top_k_dft)
+        elif top_catalysts is not None:
             top_dft = top_catalysts.head(config.top_k_dft)
+        else:
+            top_dft = None
+        if top_dft is not None:
             for idx, row in top_dft.iterrows():
                 try:
                     genome = ast.literal_eval(row['genome'])

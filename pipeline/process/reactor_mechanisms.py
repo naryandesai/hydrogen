@@ -11,7 +11,12 @@ not a gas-phase tracer. Surface carbon remains as C_s (site-blocking).
 Output follows the Cantera 3.x YAML format.
 """
 
+import json
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Mapping, Optional
+
+import numpy as np
 
 from pipeline.common.utils import (
     eV_to_J, MECHANISMS_DIR, setup_logger,
@@ -20,6 +25,82 @@ from pipeline.common.utils import (
 logger = setup_logger('reactor_mechanisms', 'reactor/mechanism_generation.log')
 
 NA = 6.02214076e23  # Avogadro's number
+
+@dataclass(frozen=True)
+class CandidateKinetics:
+    """Candidate-specific inputs and honest provenance for one mechanism.
+
+    Screening adsorption energies set adsorbed H/CH3/C thermochemistry.
+    They are not reinterpreted as activation barriers. Missing elementary
+    barriers keep declared template values until NEB or measured kinetics
+    replaces them.
+    """
+
+    methane_activation_eV: float
+    h_adsorption_eV: Optional[float] = None
+    ch3_adsorption_eV: Optional[float] = None
+    c_adsorption_eV: Optional[float] = None
+    ch3_dehydrogenation_eV: Optional[float] = None
+    ch2_dehydrogenation_eV: Optional[float] = None
+    ch_dehydrogenation_eV: Optional[float] = None
+    h2_desorption_eV: Optional[float] = None
+    carbon_transfer_eV: Optional[float] = None
+    site_density_mol_cm2: float = 2.5e-9
+    screening_protocol: str = 'unknown'
+    candidate_id: str = 'unknown'
+    sources: Mapping[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_screening_row(cls, row, candidate_id: str = 'unknown'):
+        def finite(name):
+            value = row.get(name)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+
+        barrier = finite('E_act')
+        if barrier is None or barrier <= 0:
+            raise ValueError('a finite positive E_act is required')
+        protocol = str(row.get('screening_protocol', 'unknown'))
+        sources = {'methane_activation_eV': f'screening:{protocol}'}
+        mapping = {
+            'h_adsorption_eV': 'dE_H',
+            'ch3_adsorption_eV': 'dE_CH3',
+            'c_adsorption_eV': 'dE_C',
+        }
+        values = {}
+        for target, source in mapping.items():
+            values[target] = finite(source)
+            if values[target] is not None:
+                sources[target] = f'screening:{protocol}:{source}'
+        return cls(methane_activation_eV=barrier, candidate_id=candidate_id,
+                   screening_protocol=protocol, sources=sources, **values)
+
+    def resolved(self) -> dict:
+        defaults = {
+            'ch3_dehydrogenation_eV': self.methane_activation_eV + 0.10,
+            'ch2_dehydrogenation_eV': self.methane_activation_eV + 0.15,
+            'ch_dehydrogenation_eV': self.methane_activation_eV + 0.05,
+            'h2_desorption_eV': 0.8,
+            'carbon_transfer_eV': 1.5,
+        }
+        values = asdict(self)
+        provenance = dict(self.sources)
+        for name, default in defaults.items():
+            if values[name] is None:
+                values[name] = default
+                provenance[name] = 'template_default'
+            else:
+                provenance.setdefault(name, 'candidate_specific')
+        values['provenance'] = provenance
+        values['quantitative_status'] = (
+            'candidate_specific' if not any(
+                provenance.get(name) == 'template_default' for name in defaults)
+            else 'screening_template_incomplete')
+        return values
+
 
 # Physical monolayer. ~10^19 atoms/m^2 = 2.5e-9 mol/cm^2.
 # Do not raise this to force Damköhler (B1). Extra sites come from
@@ -146,12 +227,13 @@ reactions:
     return filepath
 
 
-def write_full_mechanism(catalyst_name: str, E_act_CH4: float,
+def write_full_mechanism(catalyst_name: str, E_act_CH4: float = None,
                           E_act_H_desorb: float = 0.8,
                           E_act_C_diffuse: float = 1.5,
                           site_density: float = MONOLAYER_SITE_DENSITY_MOL_CM2,
                           T_ref: float = 1000.0,
-                          include_surface_sites: bool = True) -> Path:
+                          include_surface_sites: bool = True,
+                          kinetics: CandidateKinetics = None) -> Path:
     """
     Write a Cantera mechanism (gas + condensed graphite + optional surface).
 
@@ -160,6 +242,22 @@ def write_full_mechanism(catalyst_name: str, E_act_CH4: float,
     multiphase equilibrium / external carbon accounting.
     """
     MECHANISMS_DIR.mkdir(parents=True, exist_ok=True)
+    if kinetics is None:
+        if E_act_CH4 is None:
+            raise ValueError('E_act_CH4 or kinetics is required')
+        kinetics = CandidateKinetics(
+            methane_activation_eV=float(E_act_CH4),
+            h2_desorption_eV=float(E_act_H_desorb),
+            carbon_transfer_eV=float(E_act_C_diffuse),
+            site_density_mol_cm2=float(site_density),
+            sources={'methane_activation_eV': 'legacy_argument',
+                     'h2_desorption_eV': 'legacy_argument',
+                     'carbon_transfer_eV': 'legacy_argument'})
+    values = kinetics.resolved()
+    E_act_CH4 = float(values['methane_activation_eV'])
+    E_act_H_desorb = float(values['h2_desorption_eV'])
+    E_act_C_diffuse = float(values['carbon_transfer_eV'])
+    site_density = float(values['site_density_mol_cm2'])
     if abs(site_density - MONOLAYER_SITE_DENSITY_MOL_CM2) > 1e-15:
         raise ValueError(
             f'site_density={site_density} mol/cm^2; B1 locks Γ at '
@@ -298,6 +396,11 @@ reactions:
     filepath = MECHANISMS_DIR / f"mechanism_{catalyst_name}.yaml"
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(yaml_content)
+    sidecar = filepath.with_suffix('.kinetics.json')
+    sidecar.write_text(json.dumps({
+        'inputs': values,
+        'carbon_phase_model': 'condensed_graphite_plus_surface_C_s',
+    }, indent=2), encoding='utf-8')
 
     logger.info(f"Wrote mechanism: {filepath} (E_act={E_act_CH4:.3f} eV)")
     return filepath

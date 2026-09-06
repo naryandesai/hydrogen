@@ -153,6 +153,43 @@ def _validate_carbon_policy(config: ReactorConfig) -> None:
             'do not invent area above geometric')
 
 
+def _mechanism_metadata(config: ReactorConfig) -> dict:
+    path = Path(config.mechanism_file).with_suffix('.kinetics.json') if config.mechanism_file else None
+    if path is None or not path.exists():
+        return {'inputs': {'quantitative_status': 'missing_provenance'},
+                'carbon_phase_model': 'unknown'}
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return {'inputs': {'quantitative_status': 'invalid_provenance'},
+                'carbon_phase_model': 'unknown'}
+
+
+def _kinetics_evidence(config: ReactorConfig) -> dict:
+    """Declare whether reactor output may make a candidate-level decision."""
+    metadata = _mechanism_metadata(config)
+    status = metadata.get('inputs', {}).get(
+        'quantitative_status', 'missing_provenance')
+    carbon_model = metadata.get('carbon_phase_model', 'unknown')
+    limitations = []
+    if status != 'candidate_specific':
+        limitations.append('incomplete_candidate_kinetics')
+    if carbon_model == 'legacy_gas_tracer':
+        limitations.append('legacy_gas_carbon_tracer')
+    elif carbon_model == 'unknown':
+        limitations.append('unknown_carbon_phase_model')
+    complete = not limitations
+    return {
+        'kinetics_status': status,
+        'carbon_phase_model': carbon_model,
+        'reactor_evidence_tier': (
+            'candidate_specific_kinetics' if complete else
+            'diagnostic_screening_template'),
+        'can_exclude_candidate': bool(complete),
+        'reactor_evidence_limitations': limitations,
+    }
+
+
 def _policy_metadata(config: ReactorConfig) -> Dict:
     return {
         'co2_permitted': bool(config.co2_permitted),
@@ -475,6 +512,7 @@ def simulate_mmbcr(config: ReactorConfig) -> Dict:
         'conversion_profile': conversion_profile,
         'temperature_profile': temperature_profile,
         'theta_C_profile': [0.0] * len(conversion_profile),
+        **_kinetics_evidence(config),
         **_policy_metadata(config),
     }
     logger.info(
@@ -584,6 +622,7 @@ def simulate_pfr(config: ReactorConfig) -> Dict:
         'max_theta_C': float(max(theta_C_axial) if theta_C_axial else 0.0),
         **kinetics_fields(config),
         **solids_inventory_fields(config, geometric_sv_pfr(config)),
+        **_kinetics_evidence(config),
         **_policy_metadata(config),
     }
     logger.info(f"  PFR result: conversion={final_conv:.2%}, τ={tau_total:.1f}s, "
@@ -679,6 +718,7 @@ def simulate_fluidized_bed(config: ReactorConfig) -> Dict:
         'per_cycle_CH4_conversion': per_cycle,
         **kinetics_fields(config),
         **solids_inventory_fields(config, geometric_sv_fluidized(config)),
+        **_kinetics_evidence(config),
         **_policy_metadata(config),
     }
     logger.info(f"  Fluidized result: conversion={final_conv:.2%} mode={config.fluidized_mode}")
@@ -714,6 +754,7 @@ def _mock_reactor_result(config: ReactorConfig, reactor_type: str) -> Dict:
         'solid_C_selectivity': 0.90,
         'exit_x_H2': conversion * 0.95 * 2.0 / (1.0 + conversion * 0.95),
         'mock': True,
+        **_kinetics_evidence(config),
         **_policy_metadata(config),
     }
 

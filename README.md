@@ -69,8 +69,11 @@ Inside `pipeline/`, source is grouped by responsibility:
   `surrogate_model.py`, and `small_data_ranker.py`.
 - **`validation/`:** `qe_workflows.py`, `orr_workflows.py`,
   `dft_validator.py`, and `dft_fuel_cell.py`.
-- **`process/`:** `reactor_models.py`, `ntec_model.py`, `pemfc_model.py`,
-  and `fuel_cell_stack.py`.
+- **`process/`:** `reactor_models.py`, `reactor_mechanisms.py`,
+  `inventory_sweep.py`, `phase2_scorecard.py`, `staged_sweep.py`,
+  `equilibrium_check.py`, `ntec_model.py`, `pemfc_model.py`, and
+  `fuel_cell_stack.py`.
+- **`stages/`:** shared candidate-to-Cantera handoff.
 - **`evidence/`:** `prior_art.py`, `novelty_benchmark.py`,
   `readiness.py`, `campaign_status.py`, and `report_generator.py`.
 - **`common/`:** design-space definitions, scope rules, confidence policy,
@@ -136,6 +139,22 @@ Phase 5: FUEL CELL                        Phase 6: REPORTING
 │  └─ N-cell stack + BOP + TEA    │      └──────────────────────────┘
 └─────────────────────────────────┘
 ```
+
+The runtime implementation separates scientific application logic from shared
+execution mechanics:
+
+- `pipeline/screening/protocols.py` is the single immutable source for eSen
+  protocol IDs and relaxation budgets.
+- `pipeline/screening/gpu_executor.py` owns CUDA topology, multiprocessing,
+  leased tasks, heartbeats, ordered result collection, and CSV persistence.
+- `surface_screener.py` and `fc_screener.py` retain only their application
+  structures, reference states, descriptors, and summary reporting.
+- `pipeline/stages/reactor.py` is the common candidate-to-Cantera handoff used
+  by both the standard orchestrator and production campaign entry point.
+
+The public screening and campaign commands and their CSV/JSON schemas remain
+compatible; this separation is organizational and does not change fidelity or
+scientific acceptance rules.
 
 ---
 
@@ -260,8 +279,9 @@ ranking whenever an uncensored candidate is available.
 |-------|---------------|
 | Rate constants | Arrhenius: `k = A × exp(-E_act / k_B T)`, A from TST |
 | Surface reactions | Cantera `ReactorSurface` with custom YAML mechanism |
-| Solid carbon | Modeled as `C_graphite` gas-phase tracer species |
-| Reactor types | MMBCR (molten metal bubble column), PFR, fluidized bed |
+| Solid carbon | Condensed `C(gr)` plus site-blocking `C_s`. Not a gas-phase tracer. |
+| Solids inventory | Geometric `a = 6(1−ε)/d_p` × loading × dispersion (both ≤ 1). Γ locked at a monolayer (`2.5×10⁻⁹ mol/cm²`). Production defaults: `d_p = 0.13 mm`, loading `0.5`, dispersion `0.3`. |
+| Reactor types | MMBCR (bubble-area flotation ODE), PFR, fluidized bed |
 
 ### Fuel Cell Models
 
@@ -373,8 +393,8 @@ The pipeline relies on Meta's FAIR Chemistry **eSen (EquiformerV2 Energy-Conserv
 3. **Deploy Token to Workspace**:
    Create a file named `.hf_token` in the root of the project repository containing ONLY your token:
    ```bash
-   echo "hf_your_token_here" > /home/ilhanraja/.gemini/antigravity/scratch/hydrogen/.hf_token
-   chmod 600 /home/ilhanraja/.gemini/antigravity/scratch/hydrogen/.hf_token
+   printf '%s\n' "hf_your_token_here" > .hf_token
+   chmod 600 .hf_token
    ```
    Alternatively, you can export it to your environment:
    ```bash
@@ -421,7 +441,7 @@ export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 # Launch GPU-saturated campaign across all GPUs
-nohup /home/ilhanraja/miniconda3/envs/fairchem-env/bin/python -u run_production_campaign.py \
+nohup conda run --no-capture-output -n fairchem-env python -u run_production_campaign.py \
   --calibration-probes 500 \
   --validation-batch 500 \
   --branch-leaf-size 1000000 \
@@ -431,6 +451,22 @@ nohup /home/ilhanraja/miniconda3/envs/fairchem-env/bin/python -u run_production_
   --top-k 200 \
   > results/campaign_v6.log 2>&1 &
 ```
+
+No Conda installation directory is assumed. Quantum ESPRESSO executables are
+resolved in this order: `PW_X`/`NEB_X` overrides, the current `PATH`, then a
+query of the documented `qe-env` through the `conda` command found on `PATH`.
+MPI uses `MPIEXEC` when set, then an executable next to QE, then `mpirun` from
+`PATH` or `qe-env`. Examples for non-Conda or module-based installations:
+
+```bash
+export PW_X="$(command -v pw.x)"
+export NEB_X="$(command -v neb.x)"
+export MPIEXEC="$(command -v mpirun)"
+```
+
+If these programs are absent, the relevant high-fidelity stage fails with the
+required variable and installation instructions; it never guesses a home
+directory or silently substitutes another executable.
 
 **Key parameters:**
 
@@ -768,6 +804,35 @@ Optimization is applied at the bottleneck appropriate to each fidelity layer:
    direct A/B control. Scientific tests cover equations, device affinity, energy/
    force invariance, and single-versus-batched inference equivalence.
 
+Every eSen geometry state is fail-closed under screening protocol `relax-v3`.
+Clean structures and each adsorbate retain the final maximum force, optimizer
+steps, requested force threshold, termination reason, and SHA-256 geometry
+digest. Exhausting the BFGS step allowance is an incomplete calculation—not a
+valid candidate—even when finite energies are available. This deliberately
+reduces headline validity rates while preventing unconverged trajectories from
+becoming champions or training labels.
+
+Difficult but physically sane structures receive a deterministic recovery
+ladder without relaxing the final force criterion: standard BFGS; reset to the
+original geometry followed by conservative FIRE preconditioning and small-step
+BFGS; then a final small-step, downhill-checked FIRE attempt from the best finite
+geometry. Initial atomic overlaps, invalid periodic cells, non-finite geometry,
+optimizer exceptions, and exhausted force recovery are classified separately.
+All attempts, their geometry digests, forces, and cumulative cost are retained.
+On the local 14-class calibration probes this raised fully converged validity
+from 5–6/14 to 12/14 for pyrolysis and from 5/14 to 12/14 for ORR, at roughly
+1.8× the smoke-test runtime. The remaining failures stayed invalid rather than
+being forced through the gate.
+
+GPU workers use a leased-task health protocol. Model/reference initialization
+must emit a startup acknowledgement; a separate heartbeat continues during long
+candidate evaluations; every task emits start and result events. The supervisor
+enforces startup, heartbeat, and no-result deadlines, requeues work leased to a
+failed worker, permits one bounded restart, and writes an atomic success/failure
+manifest (`surface_worker_health.json` or `orr_worker_health.json`). A repeated
+failure stops the campaign with the unfinished count instead of hanging or
+silently producing a partial database.
+
 The current local optimum is deliberately a measured default, not a universal
 constant. Re-run `test_gpu_affinity_contract.py` with
 `HYDROGEN_WORKERS_PER_GPU=1`, `2`, and `3`; use
@@ -947,10 +1012,42 @@ The eSen screener builds physically realistic, periodic atomic structures for al
 
 ### Phase 2: Cantera Reactor Simulation
 
-For each top-K catalyst from Phase 1:
-1. Generate a Cantera YAML mechanism with TST-derived rate constants calibrated to the catalyst's E_act
-2. Simulate three reactor types (MMBCR, PFR, fluidized bed) across the standardized 4 temperatures (500°C to 1300 K / 773.15–1300 K)
-3. Record CH₄ conversion, H₂ selectivity, carbon yield, residence time
+Phase 2-only (pilot CSV already present):
+
+```powershell
+conda activate cp2k-env
+$env:PYTHONUTF8="1"
+python -m pipeline.orchestrator --phase 2
+```
+
+For each pyrolysis-admissible catalyst (`phase_stable_at_application_T`; [ADR 0001](docs/adr/0001-pyrolysis-phase-admissibility.md)):
+1. Build a typed `CandidateKinetics` record from the screening row. `E_act`, H*, CH3*, and C* adsorption descriptors keep protocol provenance; missing elementary barriers are labeled `template_default`.
+2. Write a Cantera YAML with condensed `C(gr)` and a Langmuir surface ending at `C_s`. There is **no** gas-phase `C_graphite` tracer. Γ is a monolayer (`2.5×10⁻⁹ mol/cm²`); do not raise it to force Damköhler. A `.kinetics.json` sidecar records every resolved parameter.
+3. Simulate MMBCR, PFR, and circulating fluidized bed at 773.15, 900, 1100, and 1300 K, 1 bar, flowing CH₄.
+4. Report single-pass X, active `a`, WHSV (1/τ in h⁻¹), and Ergun ΔP. Judge solids on `cat_9`, not 0.01 eV H-parked cats.
+
+**Honest status.** MMBCR rate is `k(E_act,T)·a_bubble·(X_eq−X)`. It cannot exceed X_eq and reaches X_eq for large `k·a·τ` **by construction**. The 98.5% at 1300 K is a sanity check, not kinetic closure or a catalyst rank. PFR/fluidized closure is still pending (B2, B5). Do not send Phase 2 X to DFT until that gate passes.
+
+Solids inventory defaults (B1): `d_p = 0.13 mm`, metal loading `0.5`, dispersion `0.3`. Area law: `a = a_geom × loading × dispersion` (both ≤ 1). Open work: [`docs/backlog/`](docs/backlog/).
+
+Fidelity boundaries use evidence-aware admission. A converged, finite,
+uncensored atomistic row may enter quantitative Cantera screening. An
+unconverged relaxation, censored BEP estimate, out-of-domain prediction,
+missing descriptor, or numerically implausible surrogate result is not evidence
+that the chemistry is poor: it is retained as `validation_required` and given a
+class-preserving route to DFT resolution. Only an explicit hard constraint such
+as a prohibited toxic/radioactive element is terminal (`hard_excluded`).
+Reactor and validation slates reserve material-class champions before filling
+remaining capacity by score, preventing a lowest-barrier-only shortlist from
+collapsing onto familiar chemistry.
+
+Because the current Cantera mechanism still contains template elementary
+barriers, its outputs carry `reactor_evidence_tier=diagnostic_screening_template`
+and `can_exclude_candidate=false`. They may guide sensitivity analysis and
+calculation allocation, but cannot eliminate a candidate, satisfy measured
+reactor evidence, or establish industrial viability. Production also persists
+an ORR validation slate so unresolved fuel-cell candidates are not lost merely
+because they cannot yet parameterize the PEMFC model.
 
 ### Phase 3: DFT Validation (Quantum ESPRESSO)
 

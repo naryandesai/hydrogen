@@ -11,11 +11,183 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import queue
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+
+
+def test_screening_relaxations_record_and_enforce_force_convergence():
+    from ase import Atoms
+    from ase.calculators.calculator import Calculator, all_changes
+    from pipeline.screening.relaxation import require_relaxation
+
+    class Harmonic(Calculator):
+        implemented_properties = ['energy', 'forces']
+        def calculate(self, atoms=None, properties=('energy',),
+                      system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            positions = np.asarray(atoms.positions)
+            self.results = {'energy': float(0.5 * (positions ** 2).sum()),
+                            'forces': -positions}
+
+    converging = Atoms('H', positions=[[0.2, 0, 0]])
+    converging.calc = Harmonic()
+    result = {'valid': False}
+    assert require_relaxation(result, converging, 'contract', 0.01, 50)
+    assert result['relax_contract_converged'] is True
+    assert result['relax_contract_max_force_eV_A'] <= 0.01
+    assert len(result['relax_contract_geometry_sha256']) == 64
+
+    incomplete = Atoms('H', positions=[[1.0, 0, 0]])
+    incomplete.calc = Harmonic()
+    result = {'valid': True}
+    assert not require_relaxation(
+        result, incomplete, 'contract', 0.01, 0, recovery=False)
+    assert result['valid'] is False and result['needs_dft_validation'] is True
+    assert result['relax_contract_termination'] == 'recovery_exhausted'
+
+
+def test_worker_supervisor_requeues_leased_task_and_writes_manifest():
+    from pipeline.screening.worker_supervisor import collect_results, emit
+
+    class FakeProcess:
+        pid = 123
+        exitcode = None
+        alive = True
+        def is_alive(self): return self.alive
+        def terminate(self): self.alive = False; self.exitcode = -15
+        def join(self, timeout=None): pass
+
+    statuses, tasks, stopped = queue.Queue(), queue.Queue(), threading.Event()
+    initial = FakeProcess()
+    emit(statuses, 'ready', 0)
+    emit(statuses, 'started', 0, 0)
+    emit(statuses, 'fatal', 0, 'injected failure')
+
+    def restart(worker_id):
+        replacement = FakeProcess()
+        def complete():
+            index, genome = tasks.get(timeout=1)
+            emit(statuses, 'ready', worker_id)
+            emit(statuses, 'started', worker_id, index)
+            emit(statuses, 'result', worker_id, (index, {
+                'genome': repr(genome), 'valid': True}))
+        threading.Thread(target=complete, daemon=True).start()
+        return replacement
+
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / 'health.json'
+        results = collect_results(
+            statuses, tasks, stopped, {0: initial}, restart, [('SAC',)],
+            'contract', manifest, startup_timeout_s=1,
+            heartbeat_timeout_s=1, result_timeout_s=2)
+        payload = __import__('json').loads(manifest.read_text())
+    assert results[0]['valid'] is True
+    assert payload['status'] == 'complete' and payload['completed'] == 1
+    assert any(event['kind'] == 'worker_restarted' for event in payload['events'])
+
+
+def test_candidate_cantera_mechanism_records_kinetics_provenance():
+    from pipeline.process.reactor_mechanisms import (
+        CandidateKinetics, write_full_mechanism)
+
+    row = {
+        'E_act': 0.72, 'dE_H': -0.30, 'dE_CH3': -0.55, 'dE_C': -1.10,
+        'screening_protocol': 'contract:relax-v3',
+    }
+    kinetics = CandidateKinetics.from_screening_row(row, candidate_id='abc')
+    path = write_full_mechanism('contract_candidate', kinetics=kinetics)
+    text = path.read_text()
+    assert 'species: [CH4, H2, C2H2, C2H4, C2H6, Ar]' in text
+    assert 'C_graphite' not in text
+    assert 'C(gr)' in text
+    assert 'adjacent-phases: [gas]' in text
+    assert 'carbon_phase_model' not in text
+    metadata = __import__('json').loads(
+        path.with_suffix('.kinetics.json').read_text())
+    inputs = metadata['inputs']
+    assert inputs['methane_activation_eV'] == 0.72
+    assert inputs['h_adsorption_eV'] == -0.30
+    assert inputs['ch3_adsorption_eV'] == -0.55
+    assert inputs['c_adsorption_eV'] == -1.10
+    assert inputs['quantitative_status'] == 'screening_template_incomplete'
+    assert inputs['provenance']['ch2_dehydrogenation_eV'] == 'template_default'
+    from pipeline.process.reactor_models import ReactorConfig, _kinetics_evidence
+    evidence = _kinetics_evidence(ReactorConfig(
+        mechanism_file=str(path), catalyst_name='contract_candidate'))
+    assert evidence['reactor_evidence_tier'] == 'diagnostic_screening_template'
+    assert evidence['can_exclude_candidate'] is False
+
+    try:
+        import cantera as ct
+    except ImportError:
+        return
+    gas = ct.Solution(str(path), 'gas')
+    surface = ct.Interface(str(path), 'contract_candidate_surface', [gas])
+    assert 'C_graphite' not in gas.species_names
+    graphite = ct.Solution(str(path), 'graphite')
+    assert 'C(gr)' in graphite.species_names
+    assert 'C_s' in surface.species_names
+
+
+def test_stage_selection_rescues_incomplete_evidence_without_feeding_reactor():
+    import pandas as pd
+    from pipeline.screening.stage_selection import (
+        select_for_reactor, select_for_validation)
+
+    frame = pd.DataFrame([
+        {'genome': "('Z', 0)", 'material_class': 'Z', 'valid': False,
+         'error': 'Unconverged clean relaxation', 'needs_dft_validation': True},
+        {'genome': "('A', 0)", 'material_class': 'A', 'valid': True,
+         'E_act': 0.20},
+        {'genome': "('B', 0)", 'material_class': 'B', 'valid': True,
+         'E_act': 0.01, 'E_act_censored': True,
+         'needs_dft_validation': True},
+        {'genome': "('C', 0)", 'material_class': 'C', 'valid': False,
+         'error': 'Contains toxic/radioactive elements: Hg',
+         'candidate_disposition': 'hard_excluded'},
+        {'genome': "('D', 0)", 'material_class': 'D', 'valid': True,
+         'E_act': 0.50},
+    ])
+    reactor = select_for_reactor(frame, 10, 'E_act')
+    assert set(reactor.material_class) == {'A', 'D'}
+    assert reactor.candidate_disposition.eq('quantitative_screening').all()
+    validation = select_for_validation(frame, 10, 'E_act')
+    assert {'Z', 'B'}.issubset(set(validation.material_class))
+    assert 'C' not in set(validation.material_class)
+
+
+def test_refactored_protocol_executor_and_reactor_stage_contracts():
+    from pipeline.screening.gpu_executor import execution_layout
+    from pipeline.screening.protocols import ORR_PROTOCOL, PYROLYSIS_PROTOCOL
+    from pipeline.stages.reactor import simulate_candidate
+
+    assert execution_layout(3, 2, 'batched') == (3, 2)
+    assert execution_layout(3, 2, 'legacy') == (6, 1)
+    assert PYROLYSIS_PROTOCOL.clean.fmax_eV_A == 0.08
+    assert PYROLYSIS_PROTOCOL.adsorbate.steps == 100
+    assert ORR_PROTOCOL.reference.steps == 200
+    row = {'candidate_id': 'cid', 'E_act': 0.72, 'dE_H': -0.3,
+           'dE_CH3': -0.5, 'dE_C': -1.0,
+           'screening_protocol': PYROLYSIS_PROTOCOL.protocol_id}
+    fake_sweep = [
+        {'CH4_conversion': 0.1, 'mock': False},
+        {'CH4_conversion': 0.4, 'mock': False},
+    ]
+    with patch('pipeline.process.reactor_mechanisms.write_full_mechanism',
+               return_value=Path('contract.yaml')) as write, \
+         patch('pipeline.process.reactor_models.run_reactor_sweep',
+               return_value=fake_sweep) as sweep:
+        result = simulate_candidate(
+            row, 'contract', [800.0, 900.0], ['PFR'], forbid_mock=True)
+    assert result['candidate_id'] == 'cid'
+    assert result['best_condition']['CH4_conversion'] == 0.4
+    assert write.call_args.kwargs['kinetics'].methane_activation_eV == 0.72
+    assert sweep.call_args.kwargs['reactor_types'] == ['PFR']
 
 
 def test_arrhenius_matches_joule_and_ev_forms():
@@ -104,11 +276,49 @@ def test_qe_inputs_use_verified_cutoffs_references_and_parallel_contracts():
     with tempfile.TemporaryDirectory() as tmp:
         input_path = Path(tmp) / 'pw.in'
         input_path.write_text(molecule)
-        command = build_qe_command(
-            '/home/ilhanraja/miniconda3/envs/qe-env/bin/pw.x', str(input_path),
-            QEExecutionConfig(mpi_ranks=4, omp_threads=1, kpoint_pools=2))
+        pw = Path(tmp) / 'pw.x'
+        mpi = Path(tmp) / 'mpirun'
+        pw.write_text('#!/bin/sh\nexit 0\n')
+        mpi.write_text('#!/bin/sh\nexit 0\n')
+        pw.chmod(0o755)
+        mpi.chmod(0o755)
+        with patch.dict(os.environ, {'MPIEXEC': str(mpi)}):
+            command = build_qe_command(
+                str(pw), str(input_path),
+                QEExecutionConfig(mpi_ranks=4, omp_threads=1, kpoint_pools=2))
         assert '-np' in command and command[command.index('-np') + 1] == '4'
         assert command[command.index('-nk') + 1] == '2'
+
+
+def test_external_executable_resolution_is_machine_portable():
+    from pipeline.common.executables import resolve_executable
+
+    with tempfile.TemporaryDirectory() as tmp:
+        executable = Path(tmp) / 'portable-tool'
+        executable.write_text('#!/bin/sh\nexit 0\n')
+        executable.chmod(0o755)
+        with patch.dict(os.environ, {'PORTABLE_TOOL': str(executable)}):
+            assert resolve_executable(
+                'missing-name', env_var='PORTABLE_TOOL') == str(executable.resolve())
+        with patch.dict(os.environ, {'PATH': tmp}, clear=False):
+            assert resolve_executable('portable-tool') == str(executable.resolve())
+        with patch.dict(os.environ, {'PORTABLE_TOOL': str(Path(tmp) / 'absent')}):
+            try:
+                resolve_executable('portable-tool', env_var='PORTABLE_TOOL')
+            except RuntimeError as exc:
+                assert 'PORTABLE_TOOL is set' in str(exc)
+            else:
+                raise AssertionError('invalid executable override was accepted')
+        with patch.dict(os.environ, {}, clear=True), \
+             patch('pipeline.common.executables.shutil.which', return_value=None):
+            try:
+                resolve_executable(
+                    'absent-tool', env_var='ABSENT_TOOL', conda_env='tool-env')
+            except RuntimeError as exc:
+                message = str(exc)
+                assert 'ABSENT_TOOL' in message and 'README.md' in message
+            else:
+                raise AssertionError('missing executable did not fail explicitly')
 
 
 def test_qe_relaxation_cannot_pass_on_electronic_convergence_alone():
