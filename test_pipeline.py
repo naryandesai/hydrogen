@@ -1361,8 +1361,11 @@ def test_staged_sweep_preserves_coarse_and_proposes_roi():
             else:
                 raise AssertionError('coarse sweep must be write-once')
             roi = staged_sweep.propose_roi(coarse, spec)
-            assert roi['bounds']['x'][0] < 4.0
-            assert roi['bounds']['x'][1] >= 4.0
+            # Peak feasible cell is x=4 (last coarse level). extend_edge
+            # steps past that outer edge toward the hard wall; it does not
+            # pull the lower bound inward.
+            assert roi['bounds']['x'][0] <= 4.0
+            assert roi['bounds']['x'][1] > 4.0
             staged_sweep.write_stage('demo', 'targeted', {
                 'records': [{'score': 1.1}], 'roi': roi, 'n_grid_cells': roi['n_grid_cells']})
             bundle = staged_sweep.load_sweep('demo')
@@ -1419,6 +1422,66 @@ def test_inventory_levers_preserve_baseline_area():
         assert 'invent area' in str(exc)
     else:
         raise AssertionError('loading > 1 must fail closed')
+
+
+def test_xml_sweep_parses_headline_example():
+    from pathlib import Path
+    from pipeline.common.utils import BASE_DIR
+    from pipeline.process.xml_sweep import parse_sweep_xml
+    job = parse_sweep_xml(BASE_DIR / 'sweeps' / 'headline_cat9_1300K.xml')
+    assert job.name == 'headline_cat9_1300K'
+    assert job.catalyst_name == 'cat_9'
+    assert job.screening_index == 9
+    assert job.temperatures_K == [1300.0]
+    assert job.reactor_types == ['PFR', 'Fluidized', 'MMBCR']
+    assert job.policy['co2_permitted'] is False
+    assert job.policy['fluidized_mode'] == 'circulating'
+    assert job.policy['max_regen_cycles'] == 3
+    assert job.policy['regen_mechanism'] == 'mechanical'
+    assert len(job.cells) == 2
+    frac, env = job.cells
+    assert frac.name == 'fractional'
+    assert abs(frac.catalyst_particle_mm - 0.13) < 1e-15
+    assert abs(frac.metal_loading - 0.5) < 1e-15
+    assert abs(frac.metal_dispersion - 0.3) < 1e-15
+    assert env.name == 'envelope_1x1'
+    assert abs(env.metal_loading * env.metal_dispersion - 1.0) < 1e-15
+    template = (BASE_DIR / 'docs' / 'sweep-template.md').read_text(encoding='utf-8')
+    assert 'python runsweep.py' in template
+    assert '<sweep name=' in template
+
+
+def test_xml_sweep_rejects_invented_area():
+    import tempfile
+    from pathlib import Path
+    from pipeline.process.xml_sweep import parse_sweep_xml
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<sweep name="bad_loading">
+  <catalyst name="explicit">
+    <kinetics E_act="0.43" dE_H="-0.90"/>
+  </catalyst>
+  <conditions>
+    <temperatures unit="K">1300</temperatures>
+    <reactors>PFR</reactors>
+  </conditions>
+  <cells>
+    <cell name="overloaded">
+      <catalyst_particle_mm>0.13</catalyst_particle_mm>
+      <metal_loading>1.5</metal_loading>
+      <metal_dispersion>1.0</metal_dispersion>
+    </cell>
+  </cells>
+</sweep>
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / 'bad.xml'
+        path.write_text(xml, encoding='utf-8')
+        try:
+            parse_sweep_xml(path)
+        except ValueError as exc:
+            assert 'metal_loading' in str(exc)
+        else:
+            raise AssertionError('loading > 1 must fail closed')
 
 
 def test_solids_scorecard_judges_cat_9_not_h_parked():
@@ -1804,6 +1867,8 @@ if __name__ == '__main__':
     test("Mechanism uses condensed graphite", test_mechanism_has_condensed_graphite_not_gas_carbon)
     test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
     test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
+    test("XML sweep parses headline example", test_xml_sweep_parses_headline_example)
+    test("XML sweep rejects invented area", test_xml_sweep_rejects_invented_area)
     test("Solids scorecard takes named judge as argument", test_solids_scorecard_judges_cat_9_not_h_parked)
     test("Solids run requires loaded surface", test_solids_run_requires_loaded_surface)
     test("Mismatched catalyst name fails closed", test_mismatched_catalyst_name_fails_closed)

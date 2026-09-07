@@ -214,9 +214,15 @@ def _kinetics_evidence(config: ReactorConfig) -> dict:
         'reactor_evidence_tier': (
             'candidate_specific_kinetics' if complete else
             'diagnostic_screening_template'),
+        # Incomplete template kinetics can guide sensitivity/validation but may
+        # never eliminate a candidate or count as reactor validation.
         'can_exclude_candidate': bool(complete),
         'reactor_evidence_limitations': limitations,
     }
+
+
+def _kinetics_metadata(config: ReactorConfig) -> dict:
+    return _mechanism_metadata(config).get('inputs', {})
 
 
 def _policy_metadata(config: ReactorConfig) -> Dict:
@@ -357,6 +363,16 @@ def inventory_roi_grid_cells():
         INVENTORY_ROI_METAL_LOADING,
         INVENTORY_ROI_METAL_DISPERSION,
     )
+
+
+def _load_candidate_phases(config: ReactorConfig):
+    """Upstream name: gas plus the required candidate-specific surface."""
+    gas, _graphite, surf = _load_gas_and_surface(config)
+    if surf is None:
+        raise RuntimeError(
+            f'candidate surface phase failed to load: '
+            f'{config.catalyst_name}_surface')
+    return gas, surf
 
 
 def _load_gas_and_surface(config: ReactorConfig):

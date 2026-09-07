@@ -25,15 +25,17 @@ from pipeline.common.utils import (
 logger = setup_logger('reactor_mechanisms', 'reactor/mechanism_generation.log')
 
 NA = 6.02214076e23  # Avogadro's number
+EV_TO_J_MOL = eV_to_J * NA
+
 
 @dataclass(frozen=True)
 class CandidateKinetics:
     """Candidate-specific inputs and honest provenance for one mechanism.
 
-    Screening adsorption energies set adsorbed H/CH3/C thermochemistry.
-    They are not reinterpreted as activation barriers. Missing elementary
-    barriers keep declared template values until NEB or measured kinetics
-    replaces them.
+    Screening adsorption energies distinguish adsorbed H, CH3, and C
+    thermochemistry. They are not silently reinterpreted as activation
+    barriers. Missing elementary barriers keep declared template values
+    until candidate-specific NEB or measured kinetics replaces them.
     """
 
     methane_activation_eV: float
@@ -52,6 +54,7 @@ class CandidateKinetics:
 
     @classmethod
     def from_screening_row(cls, row, candidate_id: str = 'unknown'):
+        """Build kinetics from a pandas Series or ordinary mapping."""
         def finite(name):
             value = row.get(name)
             try:
@@ -79,6 +82,7 @@ class CandidateKinetics:
                    screening_protocol=protocol, sources=sources, **values)
 
     def resolved(self) -> dict:
+        """Return numerical values plus whether each was observed or templated."""
         defaults = {
             'ch3_dehydrogenation_eV': self.methane_activation_eV + 0.10,
             'ch2_dehydrogenation_eV': self.methane_activation_eV + 0.15,
@@ -254,9 +258,6 @@ def write_full_mechanism(catalyst_name: str, E_act_CH4: float = None,
                      'h2_desorption_eV': 'legacy_argument',
                      'carbon_transfer_eV': 'legacy_argument'})
     values = kinetics.resolved()
-    E_act_CH4 = float(values['methane_activation_eV'])
-    E_act_H_desorb = float(values['h2_desorption_eV'])
-    E_act_C_diffuse = float(values['carbon_transfer_eV'])
     site_density = float(values['site_density_mol_cm2'])
     if abs(site_density - MONOLAYER_SITE_DENSITY_MOL_CM2) > 1e-15:
         raise ValueError(
@@ -264,14 +265,22 @@ def write_full_mechanism(catalyst_name: str, E_act_CH4: float = None,
             f'{MONOLAYER_SITE_DENSITY_MOL_CM2} mol/cm^2 '
             '(raise particle S/V, loading, or dispersion instead)')
 
-    Ea_CH4 = E_act_CH4 * eV_to_J * NA
-    Ea_CH3 = (E_act_CH4 + 0.1) * eV_to_J * NA
-    Ea_CH2 = (E_act_CH4 + 0.15) * eV_to_J * NA
-    Ea_CH = (E_act_CH4 + 0.05) * eV_to_J * NA
-    Ea_H2 = E_act_H_desorb * eV_to_J * NA
-    # E_act_C_diffuse retained in signature for API compatibility; no longer
-    # mapped to a fake gas-phase carbon desorption step.
-    _ = E_act_C_diffuse
+    # Convert eV → J/mol. Adsorption energies alter surface enthalpies
+    # but are not used as activation barriers.
+    Ea_CH4 = values['methane_activation_eV'] * EV_TO_J_MOL
+    Ea_CH3 = values['ch3_dehydrogenation_eV'] * EV_TO_J_MOL
+    Ea_CH2 = values['ch2_dehydrogenation_eV'] * EV_TO_J_MOL
+    Ea_CH = values['ch_dehydrogenation_eV'] * EV_TO_J_MOL
+    Ea_H2 = values['h2_desorption_eV'] * EV_TO_J_MOL
+    # carbon_transfer_eV is recorded in the sidecar. It is not mapped to
+    # C_s => C(gr) + site (B6 is not implemented).
+    h0_h = (values['h_adsorption_eV'] * EV_TO_J_MOL
+            if values['h_adsorption_eV'] is not None else -25000.0)
+    h0_ch3 = (values['ch3_adsorption_eV'] * EV_TO_J_MOL
+              if values['ch3_adsorption_eV'] is not None else -20000.0)
+    h0_c = (values['c_adsorption_eV'] * EV_TO_J_MOL
+            if values['c_adsorption_eV'] is not None else -40000.0)
+    E_act_CH4 = float(values['methane_activation_eV'])
 
     if include_surface_sites:
         phases_and_surface = f"""\
@@ -309,7 +318,7 @@ def write_full_mechanism(catalyst_name: str, E_act_CH4: float = None,
   composition: {{C: 1, H: 3}}
   thermo:
     model: constant-cp
-    h0: -20000.0 J/mol
+    h0: {h0_ch3:.8g} J/mol
     s0: 50.0 J/mol/K
   sites: 1
 - name: CH2_s
@@ -330,29 +339,29 @@ def write_full_mechanism(catalyst_name: str, E_act_CH4: float = None,
   composition: {{H: 1}}
   thermo:
     model: constant-cp
-    h0: -25000.0 J/mol
+    h0: {h0_h:.8g} J/mol
     s0: 20.0 J/mol/K
   sites: 1
 - name: C_s
   composition: {{C: 1}}
   thermo:
     model: constant-cp
-    h0: -40000.0 J/mol
+    h0: {h0_c:.8g} J/mol
     s0: 10.0 J/mol/K
   sites: 1
   note: Surface carbon; occupies catalytic sites (coking) until removed by policy
 """
         surface_rxns = f"""\
 {catalyst_name}_surface-reactions:
-- equation: CH4 + 2 site => CH3_s + H_s
+- equation: CH4 + 2 site <=> CH3_s + H_s
   sticking-coefficient: {{A: 0.01, b: 0.0, Ea: {Ea_CH4:.1f}}}
-- equation: CH3_s + site => CH2_s + H_s
+- equation: CH3_s + site <=> CH2_s + H_s
   rate-constant: {{A: 1.0e+13, b: 0.0, Ea: {Ea_CH3:.1f}}}
-- equation: CH2_s + site => CH_s + H_s
+- equation: CH2_s + site <=> CH_s + H_s
   rate-constant: {{A: 1.0e+13, b: 0.0, Ea: {Ea_CH2:.1f}}}
-- equation: CH_s + site => C_s + H_s
+- equation: CH_s + site <=> C_s + H_s
   rate-constant: {{A: 1.0e+13, b: 0.0, Ea: {Ea_CH:.1f}}}
-- equation: 2 H_s => H2 + 2 site
+- equation: 2 H_s <=> H2 + 2 site
   rate-constant: {{A: 5.0e+13, b: 0.0, Ea: {Ea_H2:.1f}}}
 """
     else:
@@ -398,11 +407,17 @@ reactions:
         f.write(yaml_content)
     sidecar = filepath.with_suffix('.kinetics.json')
     sidecar.write_text(json.dumps({
+        'schema_version': 1,
+        'catalyst_name': catalyst_name,
+        'mechanism_file': str(filepath),
         'inputs': values,
         'carbon_phase_model': 'condensed_graphite_plus_surface_C_s',
-    }, indent=2), encoding='utf-8')
+    }, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
-    logger.info(f"Wrote mechanism: {filepath} (E_act={E_act_CH4:.3f} eV)")
+    logger.info(
+        f"Wrote mechanism: {filepath} "
+        f"(E_act={E_act_CH4:.3f} eV, "
+        f"status={values['quantitative_status']})")
     return filepath
 
 

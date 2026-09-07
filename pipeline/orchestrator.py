@@ -46,7 +46,7 @@ class PipelineConfig:
     branch_leaf_size: int = 1_000_000         # Exhaustive terminal range size
     branch_max_leaves: Optional[int] = None    # Staged execution; None = complete
     top_k_reactor: int = 50                  # Top K catalysts → reactor simulation
-    top_k_dft: int = 10                  # Top K → DFT validation
+    top_k_dft: int = 14                  # At least one class champion → DFT
     top_k_vqe: int = 3                   # Top K → VQE
 
     # Phase 2: Reactor
@@ -97,7 +97,6 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
     pipeline_state = load_json("pipeline_state.json") or {}
     top_catalysts = None
     dft_candidates = None
-    screening_valid_db = None
 
     # ═════════════════════════════════════════════════════════════════════════
     # PHASE 1: DETERMINISTIC BRANCH-AND-BOUND
@@ -124,16 +123,15 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         )
         pareto_genomes, screening_db = run_branch_discovery(branch_config)
 
-        # Select pyrolysis-admissible top-K (MetalHydride never proceeds).
+        # Admissibility first (ADR 0001), then their reactor / DFT slates.
         from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
         from pipeline.screening.stage_selection import (
-            annotate_evidence, select_for_validation)
+            annotate_evidence, select_for_reactor, select_for_validation)
         valid_db = screening_db[screening_db['valid'] == True].copy()
-        screening_valid_db = valid_db
         evidence_db = annotate_evidence(screening_db, 'E_act')
         admissible = select_turquoise_pyrolysis_candidates(valid_db, top_k=None)
-        top_catalysts = select_turquoise_pyrolysis_candidates(
-            valid_db, config.top_k_reactor)
+        top_catalysts = select_for_reactor(
+            admissible, config.top_k_reactor, 'E_act', min_per_class=1)
         dft_candidates = select_for_validation(
             admissible, config.top_k_dft, 'E_act', min_per_class=1)
 
@@ -161,14 +159,18 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         print_banner("PHASE 2: CANTERA REACTOR SIMULATION")
         t2 = time.time()
 
-        from pipeline.process.reactor_mechanisms import write_full_mechanism, write_gri30_subset
+        from pipeline.process.reactor_mechanisms import (
+            write_full_mechanism, write_gri30_subset)
         from pipeline.process.reactor_models import run_reactor_sweep
+        from pipeline.stages.reactor import simulate_candidate
         from pipeline.process.equilibrium_check import run_equilibrium_sweep
         from pipeline.process.phase2_scorecard import (
             build_solids_scorecard, log_solids_scorecard,
         )
+        from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
+        from pipeline.screening.stage_selection import (
+            select_for_reactor, select_for_validation)
 
-        # Write gas + condensed graphite mechanism; equilibrium gate first.
         write_gri30_subset()
         eq_result = run_equilibrium_sweep()
         if not eq_result.get('within_tolerance', False):
@@ -176,72 +178,44 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
                 'Equilibrium check outside tolerance '
                 f"(worst_abs_error={eq_result.get('worst_abs_error')})")
 
-        # Reactor list always comes from the full valid pool + hydride filter.
-        # Phase 1+2: use in-memory screening_valid_db. Phase-2-only: load CSV.
-        from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
-        if screening_valid_db is None:
+        # Phase-2-only: same admissibility filter, then both slates.
+        if top_catalysts is None:
             import pandas as pd
             db_path = SCREENING_DIR / "ga_full_database.csv"
             if db_path.exists():
-                screening_valid_db = pd.read_csv(db_path)
-                screening_valid_db = screening_valid_db[
-                    screening_valid_db['valid'] == True]
+                screening_db = pd.read_csv(db_path)
+                valid_db = screening_db[screening_db['valid'] == True].copy()
+                admissible = select_turquoise_pyrolysis_candidates(
+                    valid_db, top_k=None)
+                top_catalysts = select_for_reactor(
+                    admissible, config.top_k_reactor, 'E_act', min_per_class=1)
+                dft_candidates = select_for_validation(
+                    admissible, config.top_k_dft, 'E_act', min_per_class=1)
+                logger.info(
+                    f"Turquoise pyrolysis scope: {len(top_catalysts)} reactor "
+                    f"candidates from {len(valid_db)} valid rows "
+                    f"(phase_stable_at_application_T; coverage denominator unchanged)")
             elif not config.allow_mock_inputs:
                 raise RuntimeError(
                     'screening database is required; mock catalyst fallback is disabled')
             else:
                 logger.warning("No screening database found. Using mock catalysts.")
 
-        if screening_valid_db is not None:
-            before = len(screening_valid_db)
-            top_catalysts = select_turquoise_pyrolysis_candidates(
-                screening_valid_db, config.top_k_reactor)
-            logger.info(
-                f"Turquoise pyrolysis scope: {len(top_catalysts)} reactor "
-                f"candidates from {before} valid rows "
-                f"(phase_stable_at_application_T; coverage denominator unchanged)")
-        else:
-            top_catalysts = None
-
-        reactor_kwargs = {
-            'co2_permitted': False,
-            'fluidized_mode': 'circulating',
-            'max_regen_cycles': 3,
-            'regen_mechanism': 'mechanical',
-        }
         reactor_results = []
         if top_catalysts is not None:
             for idx, row in top_catalysts.iterrows():
                 cat_name = f"cat_{idx}"
-                E_act = row.get('E_act', 0.8)
-                dE_H = row.get('dE_H', -0.5)
-
-                # Generate Cantera mechanism
-                mech_path = write_full_mechanism(
-                    cat_name, E_act_CH4=E_act,
-                    E_act_H_desorb=max(0.3, abs(dE_H if dE_H is not None else -0.5)),
-                )
-
-                # Run reactor sweep
-                results = run_reactor_sweep(
-                    cat_name, str(mech_path),
-                    temperatures=list(config.reactor_temperatures),
-                    reactor_types=list(config.reactor_types),
-                    catalyst_E_act_eV=float(E_act) if E_act is not None else 0.8,
-                    catalyst_dE_H_eV=float(dE_H) if dE_H is not None else 0.0,
-                    reactor_config_kwargs=reactor_kwargs,
-                )
-                reactor_results.extend(results)
+                stage_result = simulate_candidate(
+                    row, cat_name, config.reactor_temperatures,
+                    config.reactor_types, forbid_mock=not config.allow_mock_inputs)
+                reactor_results.extend(stage_result['sweep'])
         else:
-            # Mock: run 3 test catalysts
             for name, e_act in [('NiBi_10', 0.85), ('FeC_supported', 0.65), ('CuSn_20', 1.1)]:
                 mech_path = write_full_mechanism(name, E_act_CH4=e_act)
                 results = run_reactor_sweep(
                     name, str(mech_path),
                     temperatures=list(config.reactor_temperatures),
                     reactor_types=list(config.reactor_types),
-                    catalyst_E_act_eV=e_act,
-                    reactor_config_kwargs=reactor_kwargs,
                 )
                 reactor_results.extend(results)
 
@@ -284,11 +258,6 @@ def run_pipeline(config: PipelineConfig = PipelineConfig(),
         dft_results = []
         if dft_candidates is not None:
             top_dft = dft_candidates.head(config.top_k_dft)
-        elif top_catalysts is not None:
-            top_dft = top_catalysts.head(config.top_k_dft)
-        else:
-            top_dft = None
-        if top_dft is not None:
             for idx, row in top_dft.iterrows():
                 try:
                     genome = ast.literal_eval(row['genome'])

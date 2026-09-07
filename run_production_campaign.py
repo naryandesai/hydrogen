@@ -72,18 +72,11 @@ def main():
         parser.error('scanner and QE resource dimensions must be positive')
     if args.calibration_probes < 20:
         parser.error('--calibration-probes must be at least 20 for the tree ranker')
-    from pipeline.common.application_scope import (
-        APPLICATION_PYROLYSIS, validation_quota_class_count)
-    from pipeline.common.catalyst_spaces import ALL_MATERIAL_CLASSES
-    n_quota_classes = validation_quota_class_count(
-        ALL_MATERIAL_CLASSES, APPLICATION_PYROLYSIS)
-    required_validation = n_quota_classes * args.min_validation_per_class
+    required_validation = 14 * args.min_validation_per_class
     if args.validation_batch < required_validation:
         parser.error(
             f'--validation-batch must be at least {required_validation} to reserve '
-            f'{args.min_validation_per_class} candidate(s) across {n_quota_classes} '
-            f'quota-eligible pyrolysis classes (phase-unstable classes exempt; '
-            f'coverage still 14)')
+            f'{args.min_validation_per_class} candidate(s) across all 14 classes')
     requested_qe_cpus = (args.qe_mpi_ranks * args.qe_omp_threads *
                          args.qe_max_concurrent)
     available_cpus = os.cpu_count() or 1
@@ -92,13 +85,8 @@ def main():
             f'QE allocation requests {requested_qe_cpus} CPUs, '
             f'but only {available_cpus} are visible')
 
-    # The campaign runs under fairchem-env, while Quantum ESPRESSO is installed
-    # in qe-env. Resolve it explicitly so DFT does not depend on the caller's PATH.
-    if not os.environ.get('PW_X'):
-        envs_dir = Path(sys.executable).resolve().parents[2]
-        qe_binary = envs_dir / 'qe-env' / 'bin' / 'pw.x'
-        if qe_binary.is_file():
-            os.environ['PW_X'] = str(qe_binary)
+    # QE executables are resolved at execution time from PW_X/NEB_X, PATH, or
+    # by querying the documented qe-env through the PATH-resolved conda command.
     os.environ['QE_MPI_RANKS'] = str(args.qe_mpi_ranks)
     os.environ['QE_OMP_THREADS'] = str(args.qe_omp_threads)
 
@@ -234,20 +222,16 @@ def main():
 
     from pipeline.common.application_scope import select_turquoise_pyrolysis_candidates
     from pipeline.screening.stage_selection import (
-        annotate_evidence, select_for_validation)
-
+        annotate_evidence, select_for_reactor, select_for_validation)
     valid_db = screening_db[screening_db['valid'] == True].copy()
-    ranking_db = valid_db
-    if 'E_act_censored' in ranking_db.columns:
-        uncensored = ranking_db[ranking_db['E_act_censored'] != True]
-        if len(uncensored):
-            ranking_db = uncensored
     evidence_db = annotate_evidence(screening_db, 'E_act')
-    admissible = select_turquoise_pyrolysis_candidates(ranking_db, top_k=None)
-    top_catalysts = select_turquoise_pyrolysis_candidates(ranking_db, args.top_k)
+    admissible = select_turquoise_pyrolysis_candidates(valid_db, top_k=None)
+    top_catalysts = select_for_reactor(
+        admissible, args.top_k, 'E_act',
+        min_per_class=args.min_validation_per_class)
     dft_candidates = select_for_validation(
-        admissible, min(args.validation_batch, max(len(admissible), 1)),
-        'E_act', min_per_class=args.min_validation_per_class)
+        admissible, min(args.validation_batch, max(len(admissible), 1)), 'E_act',
+        min_per_class=args.min_validation_per_class)
 
     pipeline_state['phase1'] = {
         'pareto_size': len(pareto_genomes),
@@ -270,37 +254,29 @@ def main():
         print_banner("PHASE 2: CANTERA REACTOR SIMULATION")
         t2 = time.time()
         try:
-            from pipeline.process.reactor_mechanisms import write_full_mechanism
-            from pipeline.process.reactor_models import run_reactor_sweep
+            from pipeline.stages.reactor import simulate_candidate
             from pipeline.process.equilibrium_check import run_equilibrium_sweep
+            from pipeline.process.phase2_scorecard import (
+                build_solids_scorecard, log_solids_scorecard)
 
             reactor_temps = [773.15, 900.0, 1100.0, 1300.0]
             eq_result = run_equilibrium_sweep()
             print(f"  Equilibrium check within_tol={eq_result.get('within_tolerance')} "
                   f"worst_err={eq_result.get('worst_abs_error')}")
-            reactor_kwargs = {
-                'co2_permitted': False,
-                'fluidized_mode': 'circulating',
-                'max_regen_cycles': 3,
-                'regen_mechanism': 'mechanical',
-            }
 
             reactor_results = []
+            reactor_sweep_records = []
             n_reactor = min(20, len(top_catalysts))
             for i, (_, row) in enumerate(top_catalysts.head(n_reactor).iterrows()):
                 e_act = row.get('E_act', 1.0)
                 cat_name = f"catalyst_{i}"
                 print(f"  Reactor sim {i+1}/{n_reactor}: E_act={e_act:.3f} eV")
                 try:
-                    # Generate Cantera YAML mechanism from E_act
-                    mech_file = write_full_mechanism(cat_name, e_act)
-                    sweep = run_reactor_sweep(cat_name, str(mech_file),
-                                              temperatures=reactor_temps,
-                                              catalyst_E_act_eV=e_act,
-                                              reactor_config_kwargs=reactor_kwargs)
-                    if any(result.get('mock') for result in sweep):
-                        raise RuntimeError('mock reactor output is forbidden in production')
-                    best_condition = max(sweep, key=lambda r: r.get('CH4_conversion', 0)) if sweep else {}
+                    stage_result = simulate_candidate(
+                        row, cat_name, reactor_temps, forbid_mock=True)
+                    sweep = stage_result['sweep']
+                    reactor_sweep_records.extend(sweep)
+                    best_condition = stage_result['best_condition']
                     best_conv = best_condition.get('CH4_conversion', 0)
                     reactor_results.append({
                         'catalyst': cat_name,
@@ -309,7 +285,9 @@ def main():
                         'n_conditions': len(sweep),
                         **{k: best_condition.get(k) for k in (
                             'temperature_K', 'H2_selectivity', 'CH4_conversion',
-                            'deactivation_fraction_per_h', 'coke_fraction')},
+                            'deactivation_fraction_per_h', 'coke_fraction',
+                            'kinetics_status', 'reactor_evidence_tier',
+                            'can_exclude_candidate')},
                     })
                 except Exception as e:
                     print(f"    Reactor error: {e}")
@@ -328,9 +306,20 @@ def main():
                         **estimate,
                     })
 
+            scorecard = build_solids_scorecard(reactor_sweep_records)
+            save_json(scorecard, 'phase2_solids_scorecard.json', subdir='reactor')
+            class _PrintLogger:
+                def info(self, msg):
+                    print(f"  {msg}")
+            log_solids_scorecard(scorecard, _PrintLogger())
             pipeline_state['phase2'] = {
                 'catalysts_simulated': len(reactor_results),
                 'elapsed_s': time.time() - t2,
+                'equilibrium_check': {
+                    'within_tolerance': eq_result.get('within_tolerance'),
+                    'worst_abs_error': eq_result.get('worst_abs_error'),
+                },
+                'solids_scorecard': scorecard,
             }
             from pipeline.validation.viability import evaluate_turquoise
             viability = [evaluate_turquoise(r) for r in reactor_results]
@@ -359,7 +348,10 @@ def main():
             from pipeline.validation.task_queue import ValidationTaskQueue
             from pipeline.search.discovery import candidate_id
 
-            n_dft = min(10, len(top_catalysts))
+            represented_classes = (
+                dft_candidates['material_class'].nunique()
+                if 'material_class' in dft_candidates else 0)
+            n_dft = min(max(10, represented_classes), len(dft_candidates))
             dft_tasks = []
             protocol_id = (
                 f'screening-dft-v2:sssp-1.3.0:physical-realization-v2:'
@@ -368,7 +360,7 @@ def main():
             task_queue = ValidationTaskQueue(
                 Path('results/dft/validation_tasks.sqlite'))
             task_queue.recover_stale()
-            for idx, (_, row) in enumerate(top_catalysts.head(n_dft).iterrows()):
+            for idx, (_, row) in enumerate(dft_candidates.head(n_dft).iterrows()):
                 try:
                     genome = ast.literal_eval(row['genome'])
                     cid = candidate_id(genome)
@@ -502,15 +494,27 @@ def main():
         fc_pareto, fc_screening_db = run_fc_branch_discovery(fc_config)
 
         fc_valid = fc_screening_db[fc_screening_db['valid'] == True].copy()
-        if 'orr_overpotential_V' in fc_valid.columns:
-            top_fc = fc_valid.nsmallest(30, 'orr_overpotential_V')
-        else:
-            top_fc = fc_valid.head(30)
+        fc_evidence = annotate_evidence(
+            fc_screening_db, 'orr_overpotential_V')
+        top_fc = select_for_reactor(
+            fc_screening_db, 30, 'orr_overpotential_V',
+            min_per_class=1)
+        fc_validation = select_for_validation(
+            fc_screening_db, min(args.validation_batch, len(fc_screening_db)),
+            'orr_overpotential_V', min_per_class=args.min_validation_per_class)
+        fc_validation_path = Path('results/fuel_cell/validation_slate.csv')
+        fc_validation_path.parent.mkdir(parents=True, exist_ok=True)
+        fc_validation.to_csv(fc_validation_path, index=False)
 
         pipeline_state['phase5_branch'] = {
             'pareto_size': len(fc_pareto),
             'total_evaluated': len(fc_screening_db),
             'valid_count': len(fc_valid),
+            'pemfc_model_count': len(top_fc),
+            'validation_resolution_count': len(fc_validation),
+            'validation_slate': str(fc_validation_path),
+            'candidate_dispositions': fc_evidence[
+                'candidate_disposition'].value_counts().to_dict(),
             'elapsed_s': time.time() - t5,
         }
         if len(fc_valid) > 0 and 'orr_overpotential_V' in fc_valid.columns:
