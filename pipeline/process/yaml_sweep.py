@@ -1,26 +1,32 @@
-"""Load a reactor-cell sweep from XML and run it.
+"""Load a reactor-cell sweep from YAML and run it.
 
-Input specs live under sweeps/*.xml (git-tracked). Run products go to
+Input specs live under sweeps/*.yaml (git-tracked). Run products go to
 results/sweeps/<name>/ (gitignored). See docs/sweep-template.md.
+
+This is not a Cantera mechanism file. Root keys are name / catalyst /
+conditions / cells. Mechanism YAML lives under mechanisms/.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
-from xml.etree import ElementTree as ET
+from typing import Any, List, Optional
 
 from pipeline.common.utils import BASE_DIR, SWEEPS_DIR, setup_logger
 
-logger = setup_logger('xml_sweep', 'reactor/xml_sweep.log')
+logger = setup_logger('yaml_sweep', 'reactor/yaml_sweep.log')
 
 ALLOWED_REACTORS = ('PFR', 'Fluidized', 'MMBCR')
-_SPLIT = re.compile(r'[\s,]+')
+DEFAULT_POLICY = {
+    'co2_permitted': False,
+    'fluidized_mode': 'circulating',
+    'max_regen_cycles': 3,
+    'regen_mechanism': 'mechanical',
+}
 
 
 @dataclass
@@ -40,39 +46,57 @@ class SweepJob:
     reactor_types: List[str]
     policy: dict
     cells: List[SweepCell]
-    source_xml: str
+    source_file: str
     screening_csv: Optional[str] = None
     screening_index: Optional[int] = None
     kinetics: dict = field(default_factory=dict)
 
 
-def _child(root: ET.Element, tag: str, required: bool = False) -> Optional[ET.Element]:
-    node = root.find(tag)
-    if required and node is None:
-        raise ValueError(f'sweep XML is missing required <{tag}>')
-    return node
+def _require_mapping(value: Any, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f'{label} must be a mapping')
+    return value
 
 
-def _text(node: Optional[ET.Element], default: str = '') -> str:
-    if node is None or node.text is None:
-        return default
-    return node.text.strip()
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('true', '1', 'yes'):
+            return True
+        if text in ('false', '0', 'no'):
+            return False
+    raise ValueError(f'expected boolean, got {value!r}')
 
 
-def _floats(text: str) -> List[float]:
-    parts = [p for p in _SPLIT.split(text.strip()) if p]
-    if not parts:
-        raise ValueError('expected at least one number')
-    return [float(p) for p in parts]
+def _as_float_list(value: Any, label: str) -> List[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, str):
+        parts = [p for p in value.replace(',', ' ').split() if p]
+        if not parts:
+            raise ValueError(f'{label}: expected at least one number')
+        return [float(p) for p in parts]
+    if isinstance(value, list):
+        if not value:
+            raise ValueError(f'{label}: expected at least one number')
+        return [float(v) for v in value]
+    raise ValueError(f'{label} must be a number or a list of numbers')
 
 
-def _as_bool(text: str) -> bool:
-    value = text.strip().lower()
-    if value in ('true', '1', 'yes'):
-        return True
-    if value in ('false', '0', 'no'):
-        return False
-    raise ValueError(f'expected boolean, got {text!r}')
+def _as_name_list(value: Any, label: str) -> List[str]:
+    if isinstance(value, str):
+        names = [p for p in value.replace(',', ' ').split() if p]
+    elif isinstance(value, list):
+        names = [str(v).strip() for v in value if str(v).strip()]
+    else:
+        raise ValueError(f'{label} must be a string or a list of names')
+    if not names:
+        raise ValueError(f'{label}: expected at least one name')
+    return names
 
 
 def _resolve(path_text: str) -> Path:
@@ -82,90 +106,117 @@ def _resolve(path_text: str) -> Path:
     return path
 
 
-def parse_sweep_xml(xml_path: Path) -> SweepJob:
-    """Parse one sweep spec. Does not touch Cantera or write mechanisms."""
-    xml_path = Path(xml_path)
-    if not xml_path.is_file():
-        raise FileNotFoundError(f'no such sweep file: {xml_path}')
-    root = ET.parse(xml_path).getroot()
-    if root.tag != 'sweep':
-        raise ValueError(f'root element must be <sweep>, got <{root.tag}>')
-    name = (root.get('name') or xml_path.stem).strip()
-    if not name:
-        raise ValueError('sweep @name is required')
+def _load_yaml(path: Path) -> dict:
+    text = path.read_text(encoding='utf-8')
+    try:
+        from ruamel.yaml import YAML
+        data = YAML(typ='safe', pure=True).load(text)
+    except ImportError:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(
+                'sweep specs need ruamel.yaml (Cantera) or PyYAML') from exc
+        data = yaml.safe_load(text)
+    return _require_mapping(data, 'sweep YAML')
 
-    catalyst = _child(root, 'catalyst', required=True)
-    catalyst_name = (catalyst.get('name') or name).strip()
-    screening = catalyst.find('screening')
-    kinetics_el = catalyst.find('kinetics')
+
+def parse_sweep(yaml_path: Path) -> SweepJob:
+    """Parse one sweep spec. Does not touch Cantera or write mechanisms."""
+    yaml_path = Path(yaml_path)
+    if yaml_path.suffix.lower() == '.xml':
+        raise ValueError(
+            'sweep specs are YAML; convert the file and see docs/sweep-template.md')
+    if not yaml_path.is_file():
+        raise FileNotFoundError(f'no such sweep file: {yaml_path}')
+    root = _load_yaml(yaml_path)
+    name = str(root.get('name') or yaml_path.stem).strip()
+    if not name:
+        raise ValueError('sweep name is required')
+
+    catalyst = _require_mapping(root.get('catalyst'), 'catalyst')
+    catalyst_name = str(catalyst.get('name') or name).strip()
+    screening = catalyst.get('screening')
+    kinetics_raw = catalyst.get('kinetics')
     screening_csv = None
     screening_index = None
     kinetics = {}
     if screening is not None:
+        screening = _require_mapping(screening, 'catalyst.screening')
         csv_text = screening.get('csv')
-        index_text = screening.get('index')
-        if not csv_text or index_text is None:
-            raise ValueError('<screening> requires csv and index attributes')
-        screening_csv = csv_text
-        screening_index = int(index_text)
-    if kinetics_el is not None:
+        index_val = screening.get('index')
+        if not csv_text or index_val is None:
+            raise ValueError('catalyst.screening requires csv and index')
+        screening_csv = str(csv_text)
+        screening_index = int(index_val)
+    if kinetics_raw is not None:
+        kinetics_raw = _require_mapping(kinetics_raw, 'catalyst.kinetics')
         for key in ('E_act', 'dE_H', 'dE_CH3', 'dE_C'):
-            raw = kinetics_el.get(key)
+            raw = kinetics_raw.get(key)
             if raw is not None and raw != '':
                 kinetics[key] = float(raw)
     if screening is None and 'E_act' not in kinetics:
-        raise ValueError('catalyst needs <screening csv= index=> or <kinetics E_act=>')
+        raise ValueError(
+            'catalyst needs screening: {csv, index} or kinetics: {E_act}')
 
-    conditions = _child(root, 'conditions', required=True)
-    temperatures = _floats(_text(_child(conditions, 'temperatures', required=True)))
-    reactor_text = _text(_child(conditions, 'reactors', required=True))
-    reactor_types = [r for r in _SPLIT.split(reactor_text) if r]
+    conditions = _require_mapping(root.get('conditions'), 'conditions')
+    if 'temperatures_K' in conditions:
+        temperatures = _as_float_list(conditions['temperatures_K'], 'temperatures_K')
+    elif 'temperatures' in conditions:
+        temperatures = _as_float_list(conditions['temperatures'], 'temperatures')
+    else:
+        raise ValueError('conditions.temperatures_K is required')
+    reactor_types = _as_name_list(conditions.get('reactors'), 'reactors')
     unknown = [r for r in reactor_types if r not in ALLOWED_REACTORS]
     if unknown:
         raise ValueError(f'unknown reactor type(s) {unknown}; allowed {ALLOWED_REACTORS}')
 
-    policy_el = _child(root, 'policy')
-    policy = {
-        'co2_permitted': False,
-        'fluidized_mode': 'circulating',
-        'max_regen_cycles': 3,
-        'regen_mechanism': 'mechanical',
-    }
-    if policy_el is not None:
-        if policy_el.find('co2_permitted') is not None:
-            policy['co2_permitted'] = _as_bool(_text(policy_el.find('co2_permitted')))
-        if policy_el.find('fluidized_mode') is not None:
-            policy['fluidized_mode'] = _text(policy_el.find('fluidized_mode'))
-        if policy_el.find('max_regen_cycles') is not None:
-            policy['max_regen_cycles'] = int(_text(policy_el.find('max_regen_cycles')))
-        if policy_el.find('regen_mechanism') is not None:
-            policy['regen_mechanism'] = _text(policy_el.find('regen_mechanism'))
+    policy = dict(DEFAULT_POLICY)
+    policy_raw = root.get('policy')
+    if policy_raw is not None:
+        policy_raw = _require_mapping(policy_raw, 'policy')
+        if 'co2_permitted' in policy_raw:
+            policy['co2_permitted'] = _as_bool(policy_raw['co2_permitted'])
+        if 'fluidized_mode' in policy_raw:
+            policy['fluidized_mode'] = str(policy_raw['fluidized_mode']).strip()
+        if 'max_regen_cycles' in policy_raw:
+            policy['max_regen_cycles'] = int(policy_raw['max_regen_cycles'])
+        if 'regen_mechanism' in policy_raw:
+            policy['regen_mechanism'] = str(policy_raw['regen_mechanism']).strip()
 
-    cells_el = _child(root, 'cells', required=True)
+    cells_raw = root.get('cells')
+    if not isinstance(cells_raw, list) or not cells_raw:
+        raise ValueError('cells must be a non-empty list')
     cells = []
-    for cell_el in cells_el.findall('cell'):
-        cell_name = (cell_el.get('name') or f'cell_{len(cells)}').strip()
-        d_p = float(_text(_child(cell_el, 'catalyst_particle_mm', required=True)))
-        loading = float(_text(_child(cell_el, 'metal_loading', required=True)))
-        dispersion = float(_text(_child(cell_el, 'metal_dispersion', required=True)))
+    for i, cell_raw in enumerate(cells_raw):
+        cell_raw = _require_mapping(cell_raw, f'cells[{i}]')
+        cell_name = str(cell_raw.get('name') or f'cell_{i}').strip()
+        try:
+            d_p = float(cell_raw['catalyst_particle_mm'])
+            loading = float(cell_raw['metal_loading'])
+            dispersion = float(cell_raw['metal_dispersion'])
+        except KeyError as exc:
+            raise ValueError(
+                f'{cell_name}: missing {exc.args[0]}') from exc
         if d_p <= 0:
             raise ValueError(f'{cell_name}: catalyst_particle_mm must be positive')
         if not (0.0 < loading <= 1.0 and 0.0 < dispersion <= 1.0):
             raise ValueError(
                 f'{cell_name}: metal_loading and metal_dispersion must be in (0, 1]')
         cells.append(SweepCell(cell_name, d_p, loading, dispersion))
-    if not cells:
-        raise ValueError('<cells> must contain at least one <cell>')
 
+    description = root.get('description') or ''
+    if not isinstance(description, str):
+        raise ValueError('description must be a string')
     return SweepJob(
         name=name,
-        description=' '.join(_text(_child(root, 'description')).split()),
+        description=' '.join(description.split()),
         catalyst_name=catalyst_name,
         temperatures_K=temperatures,
         reactor_types=reactor_types,
         policy=policy,
         cells=cells,
-        source_xml=str(xml_path.resolve()),
+        source_file=str(yaml_path.resolve()),
         screening_csv=screening_csv,
         screening_index=screening_index,
         kinetics=kinetics,
@@ -192,7 +243,7 @@ def _load_kinetics_row(job: SweepJob):
         h_adsorption_eV=job.kinetics.get('dE_H'),
         ch3_adsorption_eV=job.kinetics.get('dE_CH3'),
         c_adsorption_eV=job.kinetics.get('dE_C'),
-        sources={'methane_activation_eV': 'sweep_xml'},
+        sources={'methane_activation_eV': 'sweep_yaml'},
     )
 
 
@@ -217,12 +268,12 @@ def _print_table(job: SweepJob, records: list) -> None:
         )
 
 
-def run_xml_sweep(xml_path: Path) -> dict:
-    """Parse XML, write one mechanism, run every cell × T × reactor, persist JSON."""
+def run_sweep(yaml_path: Path) -> dict:
+    """Parse YAML, write one mechanism, run every cell × T × reactor, persist JSON."""
     from pipeline.process.reactor_mechanisms import write_full_mechanism
     from pipeline.process.reactor_models import run_reactor_sweep
 
-    job = parse_sweep_xml(xml_path)
+    job = parse_sweep(yaml_path)
     row, kinetics = _load_kinetics_row(job)
     try:
         e_act = float(row.get('E_act', kinetics.methane_activation_eV))
@@ -273,7 +324,7 @@ def run_xml_sweep(xml_path: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json = out_dir / 'run.json'
     out_json.write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
-    shutil.copy2(job.source_xml, out_dir / 'input.xml')
+    shutil.copy2(job.source_file, out_dir / 'input.yaml')
     logger.info(f'Wrote {out_json} ({len(records)} records)')
     _print_table(job, records)
     print(f'\nWrote {out_json}')

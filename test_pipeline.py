@@ -1424,11 +1424,10 @@ def test_inventory_levers_preserve_baseline_area():
         raise AssertionError('loading > 1 must fail closed')
 
 
-def test_xml_sweep_parses_headline_example():
-    from pathlib import Path
+def test_yaml_sweep_parses_headline_example():
     from pipeline.common.utils import BASE_DIR
-    from pipeline.process.xml_sweep import parse_sweep_xml
-    job = parse_sweep_xml(BASE_DIR / 'sweeps' / 'headline_cat9_1300K.xml')
+    from pipeline.process.yaml_sweep import parse_sweep
+    job = parse_sweep(BASE_DIR / 'sweeps' / 'headline_cat9_1300K.yaml')
     assert job.name == 'headline_cat9_1300K'
     assert job.catalyst_name == 'cat_9'
     assert job.screening_index == 9
@@ -1448,36 +1447,40 @@ def test_xml_sweep_parses_headline_example():
     assert abs(env.metal_loading * env.metal_dispersion - 1.0) < 1e-15
     template = (BASE_DIR / 'docs' / 'sweep-template.md').read_text(encoding='utf-8')
     assert 'python runsweep.py' in template
-    assert '<sweep name=' in template
+    assert 'headline_cat9_1300K.yaml' in template
+    try:
+        parse_sweep(BASE_DIR / 'sweeps' / 'headline_cat9_1300K.xml')
+    except ValueError as exc:
+        assert 'YAML' in str(exc)
+    else:
+        raise AssertionError('leftover XML specs must fail closed')
 
 
-def test_xml_sweep_rejects_invented_area():
+def test_yaml_sweep_rejects_invented_area():
     import tempfile
     from pathlib import Path
-    from pipeline.process.xml_sweep import parse_sweep_xml
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
-<sweep name="bad_loading">
-  <catalyst name="explicit">
-    <kinetics E_act="0.43" dE_H="-0.90"/>
-  </catalyst>
-  <conditions>
-    <temperatures unit="K">1300</temperatures>
-    <reactors>PFR</reactors>
-  </conditions>
-  <cells>
-    <cell name="overloaded">
-      <catalyst_particle_mm>0.13</catalyst_particle_mm>
-      <metal_loading>1.5</metal_loading>
-      <metal_dispersion>1.0</metal_dispersion>
-    </cell>
-  </cells>
-</sweep>
+    from pipeline.process.yaml_sweep import parse_sweep
+    spec = """
+name: bad_loading
+catalyst:
+  name: explicit
+  kinetics:
+    E_act: 0.43
+    dE_H: -0.90
+conditions:
+  temperatures_K: [1300]
+  reactors: [PFR]
+cells:
+  - name: overloaded
+    catalyst_particle_mm: 0.13
+    metal_loading: 1.5
+    metal_dispersion: 1.0
 """
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / 'bad.xml'
-        path.write_text(xml, encoding='utf-8')
+        path = Path(tmp) / 'bad.yaml'
+        path.write_text(spec, encoding='utf-8')
         try:
-            parse_sweep_xml(path)
+            parse_sweep(path)
         except ValueError as exc:
             assert 'metal_loading' in str(exc)
         else:
@@ -1867,8 +1870,8 @@ if __name__ == '__main__':
     test("Mechanism uses condensed graphite", test_mechanism_has_condensed_graphite_not_gas_carbon)
     test("Site density locked to monolayer", test_site_density_locked_to_monolayer)
     test("Inventory levers preserve baseline area", test_inventory_levers_preserve_baseline_area)
-    test("XML sweep parses headline example", test_xml_sweep_parses_headline_example)
-    test("XML sweep rejects invented area", test_xml_sweep_rejects_invented_area)
+    test("YAML sweep parses headline example", test_yaml_sweep_parses_headline_example)
+    test("YAML sweep rejects invented area", test_yaml_sweep_rejects_invented_area)
     test("Solids scorecard takes named judge as argument", test_solids_scorecard_judges_cat_9_not_h_parked)
     test("Solids run requires loaded surface", test_solids_run_requires_loaded_surface)
     test("Mismatched catalyst name fails closed", test_mismatched_catalyst_name_fails_closed)
